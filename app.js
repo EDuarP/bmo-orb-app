@@ -1,6 +1,8 @@
 const canvas = document.getElementById('orb');
 const ctx = canvas.getContext('2d');
 const micStatus = document.getElementById('mic-status');
+const wakeStatus = document.getElementById('wake-status');
+const heardStatus = document.getElementById('heard-status');
 
 let w = canvas.width = window.innerWidth;
 let h = canvas.height = window.innerHeight;
@@ -14,6 +16,48 @@ window.addEventListener('resize', () => {
   w = canvas.width = window.innerWidth;
   h = canvas.height = window.innerHeight;
 });
+
+function setupWakeWord() {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) {
+    wakeStatus.textContent = 'Wake word: browser STT unavailable';
+    return;
+  }
+  const recognition = new Recognition();
+  recognition.lang = 'es-CO';
+  recognition.continuous = true;
+  recognition.interimResults = true;
+
+  recognition.onstart = () => {
+    wakeStatus.textContent = 'Wake word: listening';
+  };
+
+  recognition.onresult = (event) => {
+    let transcript = '';
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      transcript += event.results[i][0].transcript + ' ';
+    }
+    transcript = transcript.trim();
+    if (transcript) heardStatus.textContent = `Heard: ${transcript}`;
+    if (/ey\s*bmo/i.test(transcript)) {
+      wakeStatus.textContent = 'Wake word: detected';
+      targetLevel = 0.95;
+      setTimeout(() => {
+        wakeStatus.textContent = 'Wake word: listening';
+      }, 2500);
+    }
+  };
+
+  recognition.onerror = () => {
+    wakeStatus.textContent = 'Wake word: restarting';
+  };
+
+  recognition.onend = () => {
+    setTimeout(() => recognition.start(), 1200);
+  };
+
+  recognition.start();
+}
 
 async function setupMic() {
   try {
@@ -104,4 +148,5 @@ function animate() {
 }
 
 setupMic();
+setupWakeWord();
 animate();
