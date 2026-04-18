@@ -9,94 +9,38 @@ const transcriptLog = document.getElementById('transcript-log');
 let w = canvas.width = window.innerWidth;
 let h = canvas.height = window.innerHeight;
 let t = 0;
-let audioLevel = 0.12;
-let targetLevel = 0.12;
-let analyser;
-let dataArray;
-let wakeCooldown;
+let audioLevel = 0.08;
+let targetLevel = 0.08;
 
 window.addEventListener('resize', () => {
   w = canvas.width = window.innerWidth;
   h = canvas.height = window.innerHeight;
 });
 
-function setupWakeWord() {
-  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!Recognition) {
-    wakeStatus.textContent = 'Wake word: browser STT unavailable';
-    heardStatus.textContent = 'Heard: STT not supported in Chromium';
-    return;
-  }
-  const recognition = new Recognition();
-  recognition.lang = 'es-CO';
-  recognition.continuous = true;
-  recognition.interimResults = true;
-
-  recognition.onstart = () => {
-    wakeStatus.textContent = 'Wake word: listening (10s window)';
+function connectBackend() {
+  const ws = new WebSocket(`ws://${window.location.host}/ws`);
+  ws.onopen = () => {
+    transcriptLog.textContent = 'Backend connected. Waiting for microphone data...';
   };
-
-  recognition.onresult = (event) => {
-    let transcript = '';
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      transcript += event.results[i][0].transcript + ' ';
+  ws.onmessage = (event) => {
+    const payload = JSON.parse(event.data);
+    if (payload.type === 'status') {
+      micStatus.textContent = `Mic: ${payload.mic}`;
+      wakeStatus.textContent = `Wake word: ${payload.wake}`;
     }
-    transcript = transcript.trim();
-    if (transcript) {
-      heardStatus.textContent = `Heard: ${transcript}`;
-      transcriptLog.textContent = transcript;
-    }
-    if (/\b(bimo|vimo)\b/i.test(transcript)) {
-      wakeStatus.textContent = 'Wake word: detected';
-      targetLevel = 0.95;
-      clearTimeout(wakeCooldown);
-      wakeCooldown = setTimeout(() => {
-        wakeStatus.textContent = 'Wake word: listening (10s window)';
-      }, 10000);
+    if (payload.type === 'audio_level') {
+      targetLevel = Math.max(0.06, Math.min(1, payload.level * 12));
+      micStatus.textContent = `Mic: ${payload.device}`;
+      heardStatus.textContent = `Heard: ${payload.heard}`;
+      levelStatus.textContent = `Level: ${payload.level.toFixed(3)}`;
+      transcriptLog.textContent = `Audio stream active from ${payload.device}. Wake word backend pending.`;
     }
   };
-
-  recognition.onerror = () => {
-    wakeStatus.textContent = 'Wake word: reconnecting';
-    transcriptLog.textContent = 'Speech recognition error, reconnecting...';
+  ws.onclose = () => {
+    micStatus.textContent = 'Mic: reconnecting';
+    wakeStatus.textContent = 'Wake word: backend reconnecting';
+    setTimeout(connectBackend, 2000);
   };
-
-  recognition.onend = () => {
-    wakeStatus.textContent = 'Wake word: reconnecting';
-    transcriptLog.textContent = 'Speech recognition ended, reconnecting...';
-    setTimeout(() => recognition.start(), 3000);
-  };
-
-  recognition.start();
-}
-
-async function setupMic() {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = audioContext.createAnalyser();
-    analyser.fftSize = 256;
-    dataArray = new Uint8Array(analyser.frequencyBinCount);
-    const source = audioContext.createMediaStreamSource(stream);
-    source.connect(analyser);
-    micStatus.textContent = 'Mic: live';
-  } catch (error) {
-    micStatus.textContent = 'Mic: permission needed';
-    console.error(error);
-  }
-}
-
-function sampleAudio() {
-  if (!analyser) {
-    targetLevel = 0.14 + Math.sin(t * 0.01) * 0.02;
-    return;
-  }
-  analyser.getByteFrequencyData(dataArray);
-  let sum = 0;
-  for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-  const avg = sum / dataArray.length / 255;
-  levelStatus.textContent = `Level: ${avg.toFixed(2)}`;
-  targetLevel = Math.max(0.08, Math.min(1, avg * 2.8));
 }
 
 function drawOrb() {
@@ -153,11 +97,9 @@ function drawOrb() {
 
 function animate() {
   t++;
-  sampleAudio();
   drawOrb();
   setTimeout(() => requestAnimationFrame(animate), 33);
 }
 
-setupMic();
-setupWakeWord();
+connectBackend();
 animate();

@@ -2,9 +2,9 @@
 set -e
 sleep 45
 cd /home/eduarp/.openclaw/workspace/repos/bmo-orb-app
-pkill -f 'http.server 8765' || true
-/usr/bin/python3 -m http.server 8765 --bind 127.0.0.1 >/tmp/bmo-orb-server.log 2>&1 &
-sleep 2
+pkill -f 'uvicorn backend:app' || true
+nohup /usr/bin/python3 -m uvicorn backend:app --host 127.0.0.1 --port 8765 >/tmp/bmo-orb-backend.log 2>&1 &
+sleep 4
 /usr/bin/chromium \
   --noerrdialogs \
   --disable-infobars \
