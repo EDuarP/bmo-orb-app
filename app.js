@@ -32,7 +32,7 @@ function setupWakeWord() {
   recognition.interimResults = true;
 
   recognition.onstart = () => {
-    wakeStatus.textContent = 'Wake word: listening';
+    wakeStatus.textContent = 'Wake word: listening (10s window)';
   };
 
   recognition.onresult = (event) => {
@@ -47,17 +47,18 @@ function setupWakeWord() {
       targetLevel = 0.95;
       clearTimeout(wakeCooldown);
       wakeCooldown = setTimeout(() => {
-        wakeStatus.textContent = 'Wake word: listening';
-      }, 5000);
+        wakeStatus.textContent = 'Wake word: listening (10s window)';
+      }, 10000);
     }
   };
 
   recognition.onerror = () => {
-    wakeStatus.textContent = 'Wake word: restarting';
+    wakeStatus.textContent = 'Wake word: reconnecting';
   };
 
   recognition.onend = () => {
-    setTimeout(() => recognition.start(), 1200);
+    wakeStatus.textContent = 'Wake word: reconnecting';
+    setTimeout(() => recognition.start(), 3000);
   };
 
   recognition.start();
