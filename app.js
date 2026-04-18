@@ -3,6 +3,7 @@ const ctx = canvas.getContext('2d');
 const micStatus = document.getElementById('mic-status');
 const wakeStatus = document.getElementById('wake-status');
 const heardStatus = document.getElementById('heard-status');
+const levelStatus = document.getElementById('level-status');
 
 let w = canvas.width = window.innerWidth;
 let h = canvas.height = window.innerHeight;
@@ -22,6 +23,7 @@ function setupWakeWord() {
   const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!Recognition) {
     wakeStatus.textContent = 'Wake word: browser STT unavailable';
+    heardStatus.textContent = 'Heard: STT not supported in Chromium';
     return;
   }
   const recognition = new Recognition();
@@ -86,6 +88,7 @@ function sampleAudio() {
   let sum = 0;
   for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
   const avg = sum / dataArray.length / 255;
+  levelStatus.textContent = `Level: ${avg.toFixed(2)}`;
   targetLevel = Math.max(0.08, Math.min(1, avg * 2.8));
 }
 
