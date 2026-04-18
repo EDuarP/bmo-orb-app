@@ -20,8 +20,7 @@ CLIENTS: set[WebSocket] = set()
 app = FastAPI()
 app.mount('/static', StaticFiles(directory=str(APP_DIR)), name='static')
 
-openwakeword.utils.download_models()
-model = Model(wakeword_models=[], inference_framework='onnx')
+model = Model(wakeword_models=[p for p in openwakeword.get_pretrained_model_paths() if 'hey_jarvis' in p], inference_framework='onnx')
 TRIGGER_THRESHOLD = 0.5
 TARGET_MODEL = 'hey_jarvis'
 
