@@ -13,21 +13,22 @@ sounddevice (1280-sample / 80 ms blocks at 16 kHz)
 
 OpenClaw integration
 ────────────────────
-Set OPENCLAW_URL to POST {"message": "..."} and expect {"reply": "..."}.
-Leave empty to skip bot querying (useful while debugging audio).
+Uses `openclaw gateway call chat.send` against a real sessionKey.
+This avoids assuming the gateway root is a plain REST chat endpoint.
 
 External systems can also push bot messages directly via:
   POST /bot_message  {"text": "..."}
 """
 import asyncio
 import json
+import os
 import queue
 import subprocess
 import tempfile
 import threading
 import time
 import unicodedata
-import urllib.request
+import uuid
 import wave
 from pathlib import Path
 
@@ -46,9 +47,8 @@ WHISPER_VENV_PYTHON = '/home/eduarp/.openclaw/workspace/.venv-audio/bin/python'
 WHISPER_MODEL_PATH = '/home/eduarp/.openclaw/workspace/models/whisper-small'
 
 # ── OpenClaw integration ───────────────────────────────────────────────────────
-# POST {"message": "..."} → expects {"reply": "..."}
-# Leave as '' to skip bot query and only show transcription.
-OPENCLAW_URL = 'http://127.0.0.1:18789'
+OPENCLAW_SESSION_KEY = os.getenv('OPENCLAW_SESSION_KEY', 'agent:main:telegram:direct:8496015214')
+OPENCLAW_TIMEOUT_MS = int(os.getenv('OPENCLAW_TIMEOUT_MS', '45000'))
 
 # ── audio / model config ───────────────────────────────────────────────────────
 TARGET_SAMPLE_RATE = 16000
@@ -171,18 +171,80 @@ def _transcribe(pcm: np.ndarray) -> str:
         Path(wav_path).unlink(missing_ok=True)
 
 
+def _extract_text(node) -> str:
+    if isinstance(node, str):
+        return node.strip()
+    if isinstance(node, list):
+        parts = [_extract_text(item) for item in node]
+        return ' '.join(p for p in parts if p).strip()
+    if isinstance(node, dict):
+        if node.get('type') == 'text' and isinstance(node.get('text'), str):
+            return node['text'].strip()
+        if 'content' in node:
+            return _extract_text(node['content'])
+    return ''
+
+
 def _query_openclaw(text: str) -> str:
-    if not OPENCLAW_URL:
+    if not OPENCLAW_SESSION_KEY:
         return ''
+
+    idempotency_key = f'bmo-orb-{uuid.uuid4()}'
+    params = json.dumps({
+        'sessionKey': OPENCLAW_SESSION_KEY,
+        'message': text,
+        'idempotencyKey': idempotency_key,
+    })
+
     try:
-        data = json.dumps({'message': text}).encode()
-        req = urllib.request.Request(
-            OPENCLAW_URL,
-            data=data,
-            headers={'Content-Type': 'application/json'},
+        history_cmd = (
+            'source ~/.nvm/nvm.sh && nvm use 22 >/dev/null && '
+            'openclaw gateway call chat.history --json '
+            f'--params {json.dumps(json.dumps({"sessionKey": OPENCLAW_SESSION_KEY}))} --timeout 5000'
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read()).get('reply', '')
+
+        baseline_count = 0
+        hist0 = subprocess.run(['bash', '-lc', history_cmd], capture_output=True, text=True, timeout=10)
+        if hist0.returncode == 0 and hist0.stdout.strip():
+            try:
+                baseline_count = len(json.loads(hist0.stdout).get('messages', []))
+            except Exception:
+                baseline_count = 0
+
+        cmd = (
+            'source ~/.nvm/nvm.sh && nvm use 22 >/dev/null && '
+            f'openclaw gateway call chat.send --json --timeout {OPENCLAW_TIMEOUT_MS} '
+            f'--params {json.dumps(params)}'
+        )
+        result = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=(OPENCLAW_TIMEOUT_MS / 1000) + 10)
+        if result.returncode != 0:
+            print(f'[OPENCLAW] chat.send failed: {result.stderr.strip() or result.stdout.strip()}', flush=True)
+            return ''
+
+        stdout = result.stdout.strip()
+        if stdout:
+            print(f'[OPENCLAW] chat.send -> {stdout}', flush=True)
+
+        deadline = time.monotonic() + max(12, OPENCLAW_TIMEOUT_MS / 1000)
+        while time.monotonic() < deadline:
+            hist = subprocess.run(['bash', '-lc', history_cmd], capture_output=True, text=True, timeout=10)
+            if hist.returncode == 0 and hist.stdout.strip():
+                try:
+                    payload = json.loads(hist.stdout)
+                    messages = payload.get('messages', [])
+                    new_messages = messages[baseline_count:]
+                    for msg in reversed(new_messages):
+                        if msg.get('role') != 'assistant':
+                            continue
+                        content = _extract_text(msg.get('content', ''))
+                        if content and content != 'Hey, ya estoy activo ✅':
+                            return content
+                except Exception as exc:
+                    print(f'[OPENCLAW] history parse error: {exc}', flush=True)
+            time.sleep(1.0)
+
+        print('[OPENCLAW] no assistant reply found before timeout', flush=True)
+        return ''
     except Exception as exc:
         print(f'[OPENCLAW] {exc}', flush=True)
         return ''
