@@ -4,6 +4,7 @@ import json
 import queue
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -68,27 +69,39 @@ def pick_arecord_device() -> str:
 
 def audio_loop():
     device = pick_arecord_device()
+    print(f'[AUDIO] Using input device: {device}', flush=True)
     cmd = ['arecord', '-D', device, '-q', '-r', '16000', '-f', 'S16_LE', '-c', '1', '-t', 'raw']
+    print(f"[AUDIO] Starting command: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     buffer = np.array([], dtype=np.int16)
+    frame_counter = 0
+    last_log = 0.0
     try:
         while True:
             chunk = proc.stdout.read(1280 * 2)
             if not chunk:
+                print('[AUDIO] Empty chunk received from arecord', flush=True)
                 continue
             pcm16 = np.frombuffer(chunk, dtype=np.int16)
             if pcm16.size == 0:
+                print('[AUDIO] Zero-length PCM frame decoded', flush=True)
                 continue
+            frame_counter += 1
             buffer = np.concatenate([buffer, pcm16])
             if buffer.size < CHUNK_SAMPLES:
+                if time.time() - last_log > 2:
+                    print(f'[AUDIO] buffering... samples={buffer.size}/{CHUNK_SAMPLES}', flush=True)
+                    last_log = time.time()
                 continue
 
             audio_i16 = buffer[:CHUNK_SAMPLES]
             buffer = buffer[-1280:]  # keep small overlap for continuity
             float_audio = audio_i16.astype(np.float32) / 32768.0
             level = float(np.sqrt(np.mean(np.square(float_audio))))
+            print(f'[AUDIO] frame={frame_counter} level={level:.4f} max={float(np.max(np.abs(float_audio))):.4f}', flush=True)
             prediction = wakeword_model.predict(audio_i16)
             score = float(prediction.get(wakeword_name, next(iter(prediction.values()), 0.0)))
+            print(f"[WAKEWORD] model={wakeword_name} score={score:.4f} threshold={WAKEWORD_THRESHOLD:.2f} detected={score >= WAKEWORD_THRESHOLD}", flush=True)
 
             payload = {
                 'level': round(level, 4),
