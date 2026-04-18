@@ -46,7 +46,7 @@ function setupWakeWord() {
       heardStatus.textContent = `Heard: ${transcript}`;
       transcriptLog.textContent = transcript;
     }
-    if (/ey\s*bmo/i.test(transcript)) {
+    if (/\b(bimo|vimo)\b/i.test(transcript)) {
       wakeStatus.textContent = 'Wake word: detected';
       targetLevel = 0.95;
       clearTimeout(wakeCooldown);
