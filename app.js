@@ -11,6 +11,7 @@ let audioLevel = 0.12;
 let targetLevel = 0.12;
 let analyser;
 let dataArray;
+let wakeCooldown;
 
 window.addEventListener('resize', () => {
   w = canvas.width = window.innerWidth;
@@ -42,9 +43,10 @@ function setupWakeWord() {
     if (/ey\s*bmo/i.test(transcript)) {
       wakeStatus.textContent = 'Wake word: detected';
       targetLevel = 0.95;
-      setTimeout(() => {
+      clearTimeout(wakeCooldown);
+      wakeCooldown = setTimeout(() => {
         wakeStatus.textContent = 'Wake word: listening';
-      }, 2500);
+      }, 5000);
     }
   };
 
@@ -104,7 +106,7 @@ function drawOrb() {
   ctx.fill();
 
   for (let ring = 0; ring < 3; ring++) {
-    const particles = 220 + ring * 60;
+    const particles = 110 + ring * 30;
     const ringRadius = baseRadius + ring * 28 + audioLevel * 24;
     for (let i = 0; i < particles; i++) {
       const angle = (i / particles) * Math.PI * 2 + t * 0.003 * (ring % 2 === 0 ? 1 : -1);
