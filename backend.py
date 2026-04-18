@@ -21,7 +21,6 @@ CLIENTS: set[WebSocket] = set()
 WAKEWORD_THRESHOLD = 0.4
 CHUNK_SECONDS = 5
 CHUNK_SAMPLES = 16000 * CHUNK_SECONDS
-WAKEWORD_MODEL_TFLITE = BMO_MODEL_DIR / 'hey_bee_moh.tflite'
 WAKEWORD_MODEL_ONNX = BMO_MODEL_DIR / 'hey_bee_moh.onnx'
 WAKEWORD_FEATURE_MODELS_DIR = BMO_MODEL_DIR / 'resources'
 
@@ -68,61 +67,61 @@ def pick_arecord_device() -> str:
     return f'hw:{match.group(1)},{match.group(2)}'
 
 
+def record_block_arecord(device: str, seconds: int) -> np.ndarray:
+    cmd = [
+        'arecord',
+        '-D', device,
+        '-q',
+        '-d', str(seconds),
+        '-r', '16000',
+        '-f', 'S16_LE',
+        '-c', '1',
+        '-t', 'raw',
+    ]
+    started_at = time.time()
+    print('GRABANDO', flush=True)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    elapsed = time.time() - started_at
+    print(f'FIN DE GRABADO {elapsed:.3f}s', flush=True)
+    if proc.returncode != 0:
+        print(f'[AUDIO] arecord returned code {proc.returncode}', flush=True)
+    pcm16 = np.frombuffer(proc.stdout, dtype=np.int16)
+    return pcm16
+
+
 def audio_loop():
     device = pick_arecord_device()
     print(f'[AUDIO] Using input device: {device}', flush=True)
-    cmd = ['arecord', '-D', device, '-q', '-r', '16000', '-f', 'S16_LE', '-c', '1', '-t', 'raw']
-    print(f"[AUDIO] Starting command: {' '.join(cmd)}", flush=True)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    buffer = np.array([], dtype=np.int16)
-    frame_counter = 0
-    last_log = 0.0
-    try:
-        while True:
-            chunk = proc.stdout.read(1280 * 2)
-            if not chunk:
-                print('[AUDIO] Empty chunk received from arecord', flush=True)
-                continue
-            pcm16 = np.frombuffer(chunk, dtype=np.int16)
-            if pcm16.size == 0:
-                print('[AUDIO] Zero-length PCM frame decoded', flush=True)
-                continue
-            frame_counter += 1
-            buffer = np.concatenate([buffer, pcm16])
-            if buffer.size < CHUNK_SAMPLES:
-                if time.time() - last_log > 2:
-                    print(f'[AUDIO] buffering... samples={buffer.size}/{CHUNK_SAMPLES}', flush=True)
-                    last_log = time.time()
-                continue
+    while True:
+        pcm16 = record_block_arecord(device, CHUNK_SECONDS)
+        if pcm16.size == 0:
+            print('[AUDIO] No samples captured', flush=True)
+            continue
+        if pcm16.size != CHUNK_SAMPLES:
+            print(f'[AUDIO] Expected {CHUNK_SAMPLES} samples, got {pcm16.size}', flush=True)
 
-            audio_i16 = buffer[:CHUNK_SAMPLES]
-            record_seconds = len(audio_i16) / 16000.0
-            print(f'GRABANDO {record_seconds:.3f}s', flush=True)
-            buffer = buffer[-1280:]  # keep small overlap for continuity
-            float_audio = audio_i16.astype(np.float32) / 32768.0
-            level = float(np.sqrt(np.mean(np.square(float_audio))))
-            print(f'[AUDIO] frame={frame_counter} level={level:.4f} max={float(np.max(np.abs(float_audio))):.4f}', flush=True)
-            prediction = wakeword_model.predict(audio_i16)
-            score = float(prediction.get(wakeword_name, next(iter(prediction.values()), 0.0)))
-            print(f'FIN DE GRABADO {record_seconds:.3f}s', flush=True)
-            print(f"[WAKEWORD] model={wakeword_name} score={score:.4f} threshold={WAKEWORD_THRESHOLD:.2f} detected={score >= WAKEWORD_THRESHOLD}", flush=True)
+        audio_i16 = pcm16[:CHUNK_SAMPLES]
+        float_audio = audio_i16.astype(np.float32) / 32768.0
+        level = float(np.sqrt(np.mean(np.square(float_audio))))
+        print(f'[AUDIO] level={level:.4f} max={float(np.max(np.abs(float_audio))):.4f}', flush=True)
+        prediction = wakeword_model.predict(audio_i16)
+        score = float(prediction.get(wakeword_name, next(iter(prediction.values()), 0.0)))
+        print(f"[WAKEWORD] model={wakeword_name} score={score:.4f} threshold={WAKEWORD_THRESHOLD:.2f} detected={score >= WAKEWORD_THRESHOLD}", flush=True)
 
-            payload = {
-                'level': round(level, 4),
-                'score': round(score, 4),
-                'detected': score >= WAKEWORD_THRESHOLD,
-                'device': device,
-            }
+        payload = {
+            'level': round(level, 4),
+            'score': round(score, 4),
+            'detected': score >= WAKEWORD_THRESHOLD,
+            'device': device,
+        }
+        try:
+            MIC_QUEUE.put_nowait(payload)
+        except queue.Full:
             try:
-                MIC_QUEUE.put_nowait(payload)
-            except queue.Full:
-                try:
-                    MIC_QUEUE.get_nowait()
-                except queue.Empty:
-                    pass
-                MIC_QUEUE.put_nowait(payload)
-    finally:
-        proc.terminate()
+                MIC_QUEUE.get_nowait()
+            except queue.Empty:
+                pass
+            MIC_QUEUE.put_nowait(payload)
 
 
 @app.get('/')
@@ -150,7 +149,7 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     CLIENTS.add(ws)
     try:
-        await ws.send_text(json.dumps({'type': 'status', 'mic': 'live', 'wake': 'hey bemo armed'}))
+        await ws.send_text(json.dumps({'type': 'status', 'mic': 'live', 'wake': 'armed'}))
         while True:
             await asyncio.sleep(1)
     except WebSocketDisconnect:
@@ -173,7 +172,7 @@ async def broadcaster():
         payload = json.dumps({
             'type': 'audio_level',
             'level': data['level'],
-            'heard': 'hey bemo' if detected_hold > 0 else '--',
+            'heard': '--',
             'device': data['device'],
             'wake': wake_state,
             'score': data['score'],
