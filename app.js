@@ -108,16 +108,16 @@ function drawOrb() {
   ctx.arc(cx, cy, baseRadius * (1.8 + audioLevel * 0.5), 0, Math.PI * 2);
   ctx.fill();
 
-  const particles = 520;
+  const particles = 220;
   for (let i = 0; i < particles; i++) {
     const angle = (i / particles) * Math.PI * 2 + t * 0.0025;
     const band = 0.55 + 0.45 * Math.sin(i * 12.9898);
-    const innerNoise = Math.sin(angle * 5 + t * 0.03 + band) * (4 + audioLevel * 10);
+    const innerNoise = Math.sin(angle * 4 + t * 0.02 + band) * (2.5 + audioLevel * 6);
     const radius = baseRadius * band + innerNoise;
     const x = cx + Math.cos(angle) * radius;
     const y = cy + Math.sin(angle) * radius;
-    const size = 1.4 + (1 - band) * 2.8 + audioLevel * 1.4;
-    const alpha = 0.18 + (1 - band) * 0.42 + audioLevel * 0.12;
+    const size = 1 + (1 - band) * 1.8 + audioLevel * 0.8;
+    const alpha = 0.14 + (1 - band) * 0.28 + audioLevel * 0.08;
     ctx.fillStyle = band < 0.35
       ? `rgba(175, 245, 255, ${alpha})`
       : band < 0.7
@@ -128,13 +128,13 @@ function drawOrb() {
     ctx.fill();
   }
 
-  ctx.strokeStyle = `rgba(180, 235, 255, ${0.18 + audioLevel * 0.2})`;
-  ctx.lineWidth = 1.25;
+  ctx.strokeStyle = `rgba(180, 235, 255, ${0.12 + audioLevel * 0.12})`;
+  ctx.lineWidth = 1;
   ctx.beginPath();
-  for (let i = 0; i <= 180; i++) {
-    const angle = (i / 180) * Math.PI * 2;
-    const wave = Math.sin(angle * 8 + t * 0.04) * (3 + audioLevel * 12);
-    const radius = baseRadius * 1.02 + wave;
+  for (let i = 0; i <= 120; i++) {
+    const angle = (i / 120) * Math.PI * 2;
+    const wave = Math.sin(angle * 6 + t * 0.03) * (2 + audioLevel * 7);
+    const radius = baseRadius * 1.01 + wave;
     const x = cx + Math.cos(angle) * radius;
     const y = cy + Math.sin(angle) * radius;
     if (i === 0) ctx.moveTo(x, y);
@@ -148,7 +148,7 @@ function animate() {
   t++;
   sampleAudio();
   drawOrb();
-  requestAnimationFrame(animate);
+  setTimeout(() => requestAnimationFrame(animate), 33);
 }
 
 setupMic();

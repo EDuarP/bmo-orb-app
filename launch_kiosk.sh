@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-sleep 14
+sleep 22
 cd /home/eduarp/.openclaw/workspace/repos/bmo-orb-app
 pkill -f 'http.server 8765' || true
 /usr/bin/python3 -m http.server 8765 --bind 127.0.0.1 >/tmp/bmo-orb-server.log 2>&1 &
