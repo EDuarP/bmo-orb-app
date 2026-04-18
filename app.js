@@ -31,9 +31,12 @@ function connectBackend() {
     if (payload.type === 'audio_level') {
       targetLevel = Math.max(0.06, Math.min(1, payload.level * 12));
       micStatus.textContent = `Mic: ${payload.device}`;
+      wakeStatus.textContent = `Wake word: ${payload.wake}`;
       heardStatus.textContent = `Heard: ${payload.heard}`;
-      levelStatus.textContent = `Level: ${payload.level.toFixed(3)}`;
-      transcriptLog.textContent = `Audio stream active from ${payload.device}. Wake word backend pending.`;
+      levelStatus.textContent = `Level: ${payload.level.toFixed(3)} | Score: ${payload.score.toFixed(3)}`;
+      transcriptLog.textContent = payload.wake === 'detected'
+        ? 'Wake word detected: hey jarvis'
+        : `Audio stream active from ${payload.device}. Listening for hey jarvis.`;
     }
   };
   ws.onclose = () => {
