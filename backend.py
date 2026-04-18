@@ -93,6 +93,21 @@ def root():
     return FileResponse(APP_DIR / 'index.html')
 
 
+@app.get('/styles.css')
+def styles():
+    return FileResponse(APP_DIR / 'styles.css')
+
+
+@app.get('/app.js')
+def app_js():
+    return FileResponse(APP_DIR / 'app.js')
+
+
+@app.get('/favicon.ico')
+def favicon():
+    return FileResponse(APP_DIR / 'favicon.ico') if (APP_DIR / 'favicon.ico').exists() else FileResponse(APP_DIR / 'index.html')
+
+
 @app.websocket('/ws')
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
