@@ -5,100 +5,148 @@
   --muted: rgba(245, 247, 255, 0.72);
   --line: rgba(255,255,255,0.12);
 }
+
 * { box-sizing: border-box; }
 html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; font-family: Inter, Arial, sans-serif; }
+
 body {
   background: radial-gradient(circle at center, rgba(42, 125, 255, 0.12), transparent 26%),
               radial-gradient(circle at 50% 30%, rgba(111, 222, 255, 0.18), transparent 24%),
               linear-gradient(180deg, var(--bg2), var(--bg));
   color: var(--text);
 }
+
 canvas {
   position: fixed;
   inset: 0;
   width: 100%;
   height: 100%;
 }
+
+/* ── HUD ───────────────────────────────────────────────────────────────────── */
 .hud {
   position: fixed;
   top: 0;
   left: 0;
   right: 0;
-  z-index: 2;
+  z-index: 4;
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 24px 28px;
+  padding: 20px 28px;
 }
+
 .brand {
   font-size: 1rem;
   font-weight: 800;
   letter-spacing: 0.18em;
+  color: rgba(120, 200, 255, 0.8);
 }
+
 .status-group {
   display: flex;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
 }
+
 .status-group span {
   border: 1px solid var(--line);
   background: rgba(255,255,255,0.05);
-  padding: 10px 14px;
+  padding: 8px 14px;
   border-radius: 999px;
   color: var(--muted);
   backdrop-filter: blur(12px);
-  font-size: 0.92rem;
+  font-size: 0.86rem;
+  transition: background 0.35s, color 0.35s, border-color 0.35s;
 }
-.center-copy {
+
+/* state badge color per state */
+#state-badge[data-state="listening"] {
+  background: rgba(68, 122, 255, 0.18);
+  border-color: rgba(68, 122, 255, 0.4);
+  color: rgba(140, 210, 255, 0.95);
+}
+#state-badge[data-state="recording"] {
+  background: rgba(40, 220, 130, 0.2);
+  border-color: rgba(40, 220, 130, 0.5);
+  color: rgba(80, 255, 170, 0.95);
+}
+#state-badge[data-state="thinking"] {
+  background: rgba(160, 80, 255, 0.2);
+  border-color: rgba(160, 80, 255, 0.5);
+  color: rgba(200, 140, 255, 0.95);
+}
+
+/* ── bubbles ───────────────────────────────────────────────────────────────── */
+.bubbles {
   position: fixed;
-  inset: auto 0 12%;
-  z-index: 2;
-  text-align: center;
-  width: min(760px, calc(100% - 32px));
-  margin: 0 auto;
+  left: 50%;
+  bottom: 56px;
+  transform: translateX(-50%);
+  width: min(700px, calc(100% - 48px));
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: stretch;
+  pointer-events: none;
 }
-.debug-panel {
-  position: fixed;
-  left: 24px;
-  right: 24px;
-  bottom: 24px;
-  z-index: 2;
-  max-width: 920px;
-  margin: 0 auto;
-  border: 1px solid var(--line);
-  background: rgba(255,255,255,0.05);
-  backdrop-filter: blur(12px);
-  border-radius: 20px;
-  padding: 16px 18px;
+
+.bubble {
+  padding: 18px 24px;
+  border-radius: 22px;
+  font-size: 1.05rem;
+  line-height: 1.65;
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255,255,255,0.14);
+  word-break: break-word;
+  animation: bubbleIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) both;
 }
-.debug-title {
-  font-size: 0.78rem;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-  color: rgba(111, 222, 255, 0.88);
-  margin-bottom: 10px;
-}
-.debug-log {
+
+.bubble.bot {
+  background: rgba(48, 100, 255, 0.22);
+  border-color: rgba(68, 140, 255, 0.38);
+  font-size: 1.18rem;
   color: var(--text);
-  font-size: 0.96rem;
-  line-height: 1.6;
-  min-height: 48px;
 }
-.eyebrow {
-  text-transform: uppercase;
-  letter-spacing: 0.16em;
-  color: rgba(111, 222, 255, 0.88);
+
+.bubble.user {
+  background: rgba(255,255,255,0.07);
+  color: rgba(245, 247, 255, 0.55);
+  font-size: 0.9rem;
+  align-self: flex-end;
+  max-width: 82%;
+  font-style: italic;
+}
+
+.bubble.removing {
+  animation: bubbleOut 0.28s ease forwards;
+}
+
+@keyframes bubbleIn {
+  from { opacity: 0; transform: translateY(22px) scale(0.93); }
+  to   { opacity: 1; transform: translateY(0)    scale(1);    }
+}
+
+@keyframes bubbleOut {
+  from { opacity: 1; transform: scale(1);           }
+  to   { opacity: 0; transform: scale(0.92) translateY(-10px); }
+}
+
+/* ── transcript label ──────────────────────────────────────────────────────── */
+.transcript {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  color: rgba(245, 247, 255, 0.35);
   font-size: 0.76rem;
-  margin-bottom: 12px;
-}
-h1 {
-  margin: 0;
-  font-size: clamp(3rem, 9vw, 7rem);
-  line-height: 0.95;
-  letter-spacing: -0.05em;
-}
-p {
-  color: var(--muted);
-  font-size: 1rem;
-  line-height: 1.7;
+  letter-spacing: 0.04em;
+  text-align: center;
+  max-width: calc(100% - 48px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
 }
