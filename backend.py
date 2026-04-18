@@ -32,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
+from scipy.signal import resample_poly
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -49,13 +50,13 @@ WHISPER_MODEL_PATH = '/home/eduarp/.openclaw/workspace/models/whisper-small'
 OPENCLAW_URL = ''
 
 # ── audio / model config ───────────────────────────────────────────────────────
-SAMPLE_RATE = 16000
+TARGET_SAMPLE_RATE = 16000
 # CRITICAL: OpenWakeWord was trained on 80ms (1280-sample) windows at 16kHz.
 # Passing larger chunks causes the model to evaluate only the LAST window and
 # miss detections earlier in the block. Always feed exactly 1280 samples.
 WAKEWORD_CHUNK = 1280
 COMMAND_SECONDS = 5
-COMMAND_SAMPLES = SAMPLE_RATE * COMMAND_SECONDS
+COMMAND_SAMPLES = TARGET_SAMPLE_RATE * COMMAND_SECONDS
 WAKEWORD_THRESHOLD = 0.5
 TRIGGER_COOLDOWN = 3.0   # min seconds between back-to-back triggers
 
@@ -108,7 +109,7 @@ def _write_wav(path: str, pcm: np.ndarray) -> None:
     with wave.open(path, 'wb') as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
+        wf.setframerate(TARGET_SAMPLE_RATE)
         wf.writeframes(pcm.astype(np.int16).tobytes())
 
 
@@ -191,30 +192,43 @@ def _respond_worker(audio: np.ndarray, device_name: str) -> None:
 # ── main audio/pipeline thread ─────────────────────────────────────────────────
 def pipeline_thread() -> None:
     device_idx = _find_usb_input()
-    device_name = (
-        sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'
-    )
+    device_info = sd.query_devices(device_idx) if device_idx is not None else sd.query_devices(sd.default.device[0])
+    device_name = device_info['name']
+    input_sample_rate = int(device_info.get('default_samplerate') or 44100)
+    input_blocksize = int(round(WAKEWORD_CHUNK * input_sample_rate / TARGET_SAMPLE_RATE))
 
     last_trigger = 0.0
+    resample_buf = np.array([], dtype=np.int16)
 
     def _sd_callback(indata, frames, time_info, status):
+        nonlocal resample_buf
         if status:
             print(f'[SD] {status}', flush=True)
-        try:
-            raw_q.put_nowait(indata[:, 0].copy())
-        except queue.Full:
-            pass  # drop oldest chunk — better than blocking the audio thread
+        mono = indata[:, 0].copy()
+        resample_buf = np.concatenate([resample_buf, mono])
+        resampled = resample_poly(resample_buf.astype(np.float32), TARGET_SAMPLE_RATE, input_sample_rate)
+        ready_samples = (len(resampled) // WAKEWORD_CHUNK) * WAKEWORD_CHUNK
+        if ready_samples == 0:
+            return
+        ready = np.clip(resampled[:ready_samples], -32768, 32767).astype(np.int16)
+        consumed_input = int(round(ready_samples * input_sample_rate / TARGET_SAMPLE_RATE))
+        resample_buf = resample_buf[consumed_input:]
+        for start in range(0, len(ready), WAKEWORD_CHUNK):
+            try:
+                raw_q.put_nowait(ready[start:start + WAKEWORD_CHUNK])
+            except queue.Full:
+                pass
 
     with sd.InputStream(
         device=device_idx,
-        samplerate=SAMPLE_RATE,
+        samplerate=input_sample_rate,
         channels=1,
         dtype='int16',
-        blocksize=WAKEWORD_CHUNK,   # 80ms — exact window OWW expects
+        blocksize=input_blocksize,
         callback=_sd_callback,
     ):
         _push({'type': 'state', 'state': 'listening', 'device': device_name})
-        print(f'[AUDIO] Stream open on "{device_name}" — feeding {WAKEWORD_CHUNK} samples/chunk', flush=True)
+        print(f'[AUDIO] Stream open on "{device_name}" at {input_sample_rate} Hz, resampling to {TARGET_SAMPLE_RATE} Hz', flush=True)
 
         state = 'listening'
         command_buf: list[np.ndarray] = []
