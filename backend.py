@@ -191,8 +191,10 @@ def _query_openclaw(text: str) -> str:
 # ── broadcast helper ───────────────────────────────────────────────────────────
 def _push(payload: dict) -> None:
     try:
+        print(f'[FRONT] queue -> {payload}', flush=True)
         broadcast_q.put_nowait(payload)
     except queue.Full:
+        print('[FRONT] broadcast queue full, dropping oldest payload', flush=True)
         try:
             broadcast_q.get_nowait()
         except queue.Empty:
@@ -215,144 +217,156 @@ def _is_exit_phrase(text: str) -> bool:
 
 # ── worker: transcribe → bot query → broadcast ─────────────────────────────────
 def _respond_worker(audio: np.ndarray, device_name: str) -> None:
-    text = _transcribe(audio)
-    print(f'[WHISPER] heard: {text!r}', flush=True)
+    try:
+        print('[CONVERSATION] worker started', flush=True)
+        text = _transcribe(audio)
+        print(f'[WHISPER] transcription -> {text!r}', flush=True)
 
-    if not text:
-        # Empty transcription — stay in conversation so user can retry.
+        if not text:
+            print('[CONVERSATION] empty transcription, staying in conversation mode', flush=True)
+            next_state_q.put('recording')
+            return
+
+        print('[OPENCLAW] sending transcript to chat backend', flush=True)
+        _push({'type': 'user_message', 'text': text})
+
+        if _is_exit_phrase(text):
+            print('[CONVERSATION] exit phrase detected — leaving conversation mode', flush=True)
+            _push({'type': 'bot_message', 'text': 'Hasta luego.'})
+            _push({'type': 'state', 'state': 'listening', 'device': device_name})
+            next_state_q.put('listening')
+            return
+
+        reply = _query_openclaw(text)
+        print(f'[OPENCLAW] reply -> {reply!r}', flush=True)
+        if reply:
+            _push({'type': 'bot_message', 'text': reply})
+        else:
+            print('[OPENCLAW] empty reply or endpoint unavailable', flush=True)
+
+        print('[CONVERSATION] returning to recording mode for next turn', flush=True)
         next_state_q.put('recording')
-        return
-
-    _push({'type': 'user_message', 'text': text})
-
-    if _is_exit_phrase(text):
-        print('[CONVERSATION] exit phrase detected — leaving conversation mode', flush=True)
-        _push({'type': 'bot_message', 'text': 'Hasta luego.'})
-        _push({'type': 'state', 'state': 'listening', 'device': device_name})
-        next_state_q.put('listening')
-        return
-
-    reply = _query_openclaw(text)
-    if reply:
-        print(f'[BOT] reply: {reply!r}', flush=True)
-        _push({'type': 'bot_message', 'text': reply})
-
-    # Stay in conversation — pipeline will record next turn without wakeword.
-    next_state_q.put('recording')
+    except Exception as exc:
+        print(f'[ERROR][WORKER] {type(exc).__name__}: {exc}', flush=True)
+        _push({'type': 'bot_message', 'text': f'Error: {type(exc).__name__}'})
+        next_state_q.put('recording')
 
 
 # ── main audio/pipeline thread ─────────────────────────────────────────────────
 def pipeline_thread() -> None:
-    device_idx = _find_usb_input()
-    device_info = sd.query_devices(device_idx) if device_idx is not None else sd.query_devices(sd.default.device[0])
-    device_name = device_info['name']
-    input_sample_rate = int(device_info.get('default_samplerate') or 44100)
-    input_blocksize = int(round(WAKEWORD_CHUNK * input_sample_rate / TARGET_SAMPLE_RATE))
+    try:
+        device_idx = _find_usb_input()
+        device_info = sd.query_devices(device_idx) if device_idx is not None else sd.query_devices(sd.default.device[0])
+        device_name = device_info['name']
+        input_sample_rate = int(device_info.get('default_samplerate') or 44100)
+        input_blocksize = int(round(WAKEWORD_CHUNK * input_sample_rate / TARGET_SAMPLE_RATE))
 
-    last_trigger = 0.0
-    resample_buf = np.array([], dtype=np.int16)
+        last_trigger = 0.0
+        resample_buf = np.array([], dtype=np.int16)
 
-    def _sd_callback(indata, frames, time_info, status):
-        nonlocal resample_buf
-        if status:
-            print(f'[SD] {status}', flush=True)
-        mono = indata[:, 0].copy()
-        resample_buf = np.concatenate([resample_buf, mono])
-        resampled = resample_poly(resample_buf.astype(np.float32), TARGET_SAMPLE_RATE, input_sample_rate)
-        ready_samples = (len(resampled) // WAKEWORD_CHUNK) * WAKEWORD_CHUNK
-        if ready_samples == 0:
-            return
-        ready = np.clip(resampled[:ready_samples], -32768, 32767).astype(np.int16)
-        consumed_input = int(round(ready_samples * input_sample_rate / TARGET_SAMPLE_RATE))
-        resample_buf = resample_buf[consumed_input:]
-        for start in range(0, len(ready), WAKEWORD_CHUNK):
-            try:
-                raw_q.put_nowait(ready[start:start + WAKEWORD_CHUNK])
-            except queue.Full:
-                pass
-
-    with sd.InputStream(
-        device=device_idx,
-        samplerate=input_sample_rate,
-        channels=1,
-        dtype='int16',
-        blocksize=input_blocksize,
-        callback=_sd_callback,
-    ):
-        _push({'type': 'state', 'state': 'listening', 'device': device_name})
-        print(f'[AUDIO] Stream open on "{device_name}" at {input_sample_rate} Hz, resampling to {TARGET_SAMPLE_RATE} Hz', flush=True)
-
-        state = 'listening'
-        command_buf: list[np.ndarray] = []
-        silence_chunks = 0
-
-        while True:
-            try:
-                chunk = raw_q.get(timeout=1.0)
-            except queue.Empty:
-                continue
-
-            rms = float(np.sqrt(np.mean(np.square(chunk.astype(np.float32) / 32768.0))))
-
-            # Worker signals back to pipeline via next_state_q when thinking ends.
-            if state == 'thinking':
+        def _sd_callback(indata, frames, time_info, status):
+            nonlocal resample_buf
+            if status:
+                print(f'[SD] {status}', flush=True)
+            mono = indata[:, 0].copy()
+            resample_buf = np.concatenate([resample_buf, mono])
+            resampled = resample_poly(resample_buf.astype(np.float32), TARGET_SAMPLE_RATE, input_sample_rate)
+            ready_samples = (len(resampled) // WAKEWORD_CHUNK) * WAKEWORD_CHUNK
+            if ready_samples == 0:
+                return
+            ready = np.clip(resampled[:ready_samples], -32768, 32767).astype(np.int16)
+            consumed_input = int(round(ready_samples * input_sample_rate / TARGET_SAMPLE_RATE))
+            resample_buf = resample_buf[consumed_input:]
+            for start in range(0, len(ready), WAKEWORD_CHUNK):
                 try:
-                    nxt = next_state_q.get_nowait()
+                    raw_q.put_nowait(ready[start:start + WAKEWORD_CHUNK])
+                except queue.Full:
+                    pass
+
+        with sd.InputStream(
+            device=device_idx,
+            samplerate=input_sample_rate,
+            channels=1,
+            dtype='int16',
+            blocksize=input_blocksize,
+            callback=_sd_callback,
+        ):
+            _push({'type': 'state', 'state': 'listening', 'device': device_name})
+            print(f'[AUDIO] Stream open on "{device_name}" at {input_sample_rate} Hz, resampling to {TARGET_SAMPLE_RATE} Hz', flush=True)
+
+            state = 'listening'
+            command_buf: list[np.ndarray] = []
+            silence_chunks = 0
+
+            while True:
+                try:
+                    chunk = raw_q.get(timeout=1.0)
                 except queue.Empty:
-                    # Still processing: keep UI alive and discard audio.
-                    _push({'type': 'audio_level', 'level': round(rms, 4), 'score': 0.0})
                     continue
-                if nxt == 'recording':
-                    print('[CONVERSATION] continuing — next turn', flush=True)
-                    command_buf = []
-                    silence_chunks = 0
-                    state = 'recording'
-                    _push({'type': 'state', 'state': 'recording'})
-                else:
-                    state = 'listening'
-                    _push({'type': 'state', 'state': 'listening', 'device': device_name})
-                continue
 
-            if state == 'listening':
-                pred = wakeword_model.predict(chunk)
-                score = float(pred.get(wakeword_name, next(iter(pred.values()), 0.0)))
-                _push({'type': 'audio_level', 'level': round(rms, 4), 'score': round(score, 4)})
-                print(f'[WW] score={score:.4f} rms={rms:.4f}', flush=True)
+                rms = float(np.sqrt(np.mean(np.square(chunk.astype(np.float32) / 32768.0))))
 
-                now = time.monotonic()
-                if score >= WAKEWORD_THRESHOLD and (now - last_trigger) >= TRIGGER_COOLDOWN:
-                    last_trigger = now
-                    print(f'[WAKEWORD] Triggered! score={score:.4f} — entering conversation', flush=True)
-                    state = 'recording'
-                    command_buf = []
-                    silence_chunks = 0
-                    _push({'type': 'state', 'state': 'recording'})
+                if state == 'thinking':
+                    try:
+                        nxt = next_state_q.get_nowait()
+                    except queue.Empty:
+                        _push({'type': 'audio_level', 'level': round(rms, 4), 'score': 0.0})
+                        continue
+                    print(f'[CONVERSATION] next state from worker -> {nxt}', flush=True)
+                    if nxt == 'recording':
+                        print('[CONVERSATION] continuing — next turn', flush=True)
+                        command_buf = []
+                        silence_chunks = 0
+                        state = 'recording'
+                        _push({'type': 'state', 'state': 'recording'})
+                    else:
+                        state = 'listening'
+                        _push({'type': 'state', 'state': 'listening', 'device': device_name})
+                    continue
 
-            elif state == 'recording':
-                command_buf.append(chunk)
-                _push({'type': 'audio_level', 'level': round(rms, 4), 'score': 0.0})
+                if state == 'listening':
+                    pred = wakeword_model.predict(chunk)
+                    score = float(pred.get(wakeword_name, next(iter(pred.values()), 0.0)))
+                    _push({'type': 'audio_level', 'level': round(rms, 4), 'score': round(score, 4)})
+                    print(f'[WW] score={score:.4f} rms={rms:.4f}', flush=True)
 
-                silence_chunks = silence_chunks + 1 if rms < SILENCE_RMS_THRESHOLD else 0
+                    now = time.monotonic()
+                    if score >= WAKEWORD_THRESHOLD and (now - last_trigger) >= TRIGGER_COOLDOWN:
+                        last_trigger = now
+                        print(f'[WAKEWORD] Triggered! score={score:.4f} — entrando a modo conversación', flush=True)
+                        state = 'recording'
+                        command_buf = []
+                        silence_chunks = 0
+                        _push({'type': 'state', 'state': 'recording'})
 
-                elapsed = len(command_buf) * CHUNK_SECONDS
-                silence_elapsed = silence_chunks * CHUNK_SECONDS
-                hit_max = elapsed >= MAX_COMMAND_SECONDS
-                hit_silence = elapsed >= MIN_COMMAND_SECONDS and silence_elapsed >= SILENCE_HANG_SECONDS
+                elif state == 'recording':
+                    command_buf.append(chunk)
+                    _push({'type': 'audio_level', 'level': round(rms, 4), 'score': 0.0})
 
-                if len(command_buf) % 12 == 1:   # ~1 log per second
-                    print(f'[REC] {elapsed:.1f}s rms={rms:.4f} silence={silence_elapsed:.2f}s', flush=True)
+                    silence_chunks = silence_chunks + 1 if rms < SILENCE_RMS_THRESHOLD else 0
 
-                if hit_max or hit_silence:
-                    reason = 'max' if hit_max else 'silence'
-                    print(f'[VAD] stop ({reason}) elapsed={elapsed:.2f}s silence={silence_elapsed:.2f}s', flush=True)
-                    audio = np.concatenate(command_buf).astype(np.int16)
-                    _push({'type': 'state', 'state': 'thinking'})
-                    state = 'thinking'
-                    threading.Thread(
-                        target=_respond_worker,
-                        args=(audio, device_name),
-                        daemon=True,
-                    ).start()
+                    elapsed = len(command_buf) * CHUNK_SECONDS
+                    silence_elapsed = silence_chunks * CHUNK_SECONDS
+                    hit_max = elapsed >= MAX_COMMAND_SECONDS
+                    hit_silence = elapsed >= MIN_COMMAND_SECONDS and silence_elapsed >= SILENCE_HANG_SECONDS
+
+                    if len(command_buf) % 12 == 1:
+                        print(f'[REC] {elapsed:.1f}s rms={rms:.4f} silence={silence_elapsed:.2f}s', flush=True)
+
+                    if hit_max or hit_silence:
+                        reason = 'max' if hit_max else 'silence'
+                        print(f'[VAD] stop ({reason}) elapsed={elapsed:.2f}s silence={silence_elapsed:.2f}s', flush=True)
+                        audio = np.concatenate(command_buf).astype(np.int16)
+                        _push({'type': 'state', 'state': 'thinking'})
+                        state = 'thinking'
+                        threading.Thread(
+                            target=_respond_worker,
+                            args=(audio, device_name),
+                            daemon=True,
+                        ).start()
+    except Exception as exc:
+        print(f'[ERROR][PIPELINE] {type(exc).__name__}: {exc}', flush=True)
+        _push({'type': 'bot_message', 'text': f'Pipeline error: {type(exc).__name__}: {exc}'})
 
 
 # ── FastAPI routes ─────────────────────────────────────────────────────────────
