@@ -131,8 +131,12 @@ def _write_wav(path: str, pcm: np.ndarray) -> None:
         wf.writeframes(pcm.astype(np.int16).tobytes())
 
 
+WHISPER_TIMEOUT_SECONDS = 90
+
+
 def _transcribe(pcm: np.ndarray) -> str:
     """Run faster-whisper on PCM audio. No language forced — auto-detects."""
+    audio_seconds = len(pcm) / TARGET_SAMPLE_RATE
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
         wav_path = f.name
     try:
@@ -148,15 +152,20 @@ def _transcribe(pcm: np.ndarray) -> str:
                 'print(text)'
             ),
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+        print(f'[WHISPER] transcribing {audio_seconds:.2f}s audio (timeout {WHISPER_TIMEOUT_SECONDS}s)…', flush=True)
+        t0 = time.monotonic()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=WHISPER_TIMEOUT_SECONDS)
+        dt = time.monotonic() - t0
         if r.returncode != 0:
-            print(f'[WHISPER] err {r.returncode}: {r.stderr.strip()[:300]}', flush=True)
+            print(f'[WHISPER] err {r.returncode} ({dt:.1f}s): {r.stderr.strip()[:300]}', flush=True)
             return ''
         if r.stderr.strip():
-            print(f'[WHISPER] {r.stderr.strip()}', flush=True)
+            print(f'[WHISPER] {r.stderr.strip()} ({dt:.1f}s)', flush=True)
+        else:
+            print(f'[WHISPER] done in {dt:.1f}s', flush=True)
         return r.stdout.strip()
     except subprocess.TimeoutExpired:
-        print('[WHISPER] timed out', flush=True)
+        print(f'[WHISPER] timed out after {WHISPER_TIMEOUT_SECONDS}s', flush=True)
         return ''
     finally:
         Path(wav_path).unlink(missing_ok=True)
@@ -283,13 +292,16 @@ def pipeline_thread() -> None:
             except queue.Empty:
                 continue
 
-            # Worker thread may have signalled the next state while we were
-            # thinking — apply it before processing the incoming chunk.
+            rms = float(np.sqrt(np.mean(np.square(chunk.astype(np.float32) / 32768.0))))
+
+            # Worker signals back to pipeline via next_state_q when thinking ends.
             if state == 'thinking':
                 try:
                     nxt = next_state_q.get_nowait()
                 except queue.Empty:
-                    continue  # still processing, discard audio
+                    # Still processing: keep UI alive and discard audio.
+                    _push({'type': 'audio_level', 'level': round(rms, 4), 'score': 0.0})
+                    continue
                 if nxt == 'recording':
                     print('[CONVERSATION] continuing — next turn', flush=True)
                     command_buf = []
@@ -300,8 +312,6 @@ def pipeline_thread() -> None:
                     state = 'listening'
                     _push({'type': 'state', 'state': 'listening', 'device': device_name})
                 continue
-
-            rms = float(np.sqrt(np.mean(np.square(chunk.astype(np.float32) / 32768.0))))
 
             if state == 'listening':
                 pred = wakeword_model.predict(chunk)
@@ -328,6 +338,9 @@ def pipeline_thread() -> None:
                 silence_elapsed = silence_chunks * CHUNK_SECONDS
                 hit_max = elapsed >= MAX_COMMAND_SECONDS
                 hit_silence = elapsed >= MIN_COMMAND_SECONDS and silence_elapsed >= SILENCE_HANG_SECONDS
+
+                if len(command_buf) % 12 == 1:   # ~1 log per second
+                    print(f'[REC] {elapsed:.1f}s rms={rms:.4f} silence={silence_elapsed:.2f}s', flush=True)
 
                 if hit_max or hit_silence:
                     reason = 'max' if hit_max else 'silence'
