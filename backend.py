@@ -26,6 +26,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.request
 import wave
 from pathlib import Path
@@ -68,9 +69,21 @@ SILENCE_RMS_THRESHOLD = 0.01
 WAKEWORD_MODEL_ONNX = BMO_MODEL_DIR / 'hey_bee_moh.onnx'
 WAKEWORD_FEATURE_DIR = BMO_MODEL_DIR / 'resources'
 
+# Phrases that end conversation mode (normalized: lowercase, no diacritics).
+EXIT_PHRASES = (
+    'adios',
+    'hasta luego',
+    'chao',
+    'chau',
+    'dejemos hasta aqui',
+    'corta',
+)
+
 # ── queues & shared state ──────────────────────────────────────────────────────
 raw_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=200)
 broadcast_q: "queue.Queue[dict]" = queue.Queue(maxsize=50)
+# Worker thread signals pipeline which state to resume ('recording' or 'listening')
+next_state_q: "queue.Queue[str]" = queue.Queue(maxsize=4)
 CLIENTS: set["WebSocket"] = set()
 
 app = FastAPI()
@@ -178,20 +191,45 @@ def _push(payload: dict) -> None:
         broadcast_q.put_nowait(payload)
 
 
+# ── exit phrase detection ──────────────────────────────────────────────────────
+def _normalize(text: str) -> str:
+    stripped = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode()
+    return stripped.lower().strip().rstrip('.,!?¡¿')
+
+
+def _is_exit_phrase(text: str) -> bool:
+    norm = _normalize(text)
+    if not norm:
+        return False
+    return any(phrase in norm for phrase in EXIT_PHRASES)
+
+
 # ── worker: transcribe → bot query → broadcast ─────────────────────────────────
 def _respond_worker(audio: np.ndarray, device_name: str) -> None:
     text = _transcribe(audio)
     print(f'[WHISPER] heard: {text!r}', flush=True)
 
-    if text:
-        _push({'type': 'user_message', 'text': text})
+    if not text:
+        # Empty transcription — stay in conversation so user can retry.
+        next_state_q.put('recording')
+        return
 
-        reply = _query_openclaw(text)
-        if reply:
-            print(f'[BOT] reply: {reply!r}', flush=True)
-            _push({'type': 'bot_message', 'text': reply})
+    _push({'type': 'user_message', 'text': text})
 
-    _push({'type': 'state', 'state': 'listening', 'device': device_name})
+    if _is_exit_phrase(text):
+        print('[CONVERSATION] exit phrase detected — leaving conversation mode', flush=True)
+        _push({'type': 'bot_message', 'text': 'Hasta luego.'})
+        _push({'type': 'state', 'state': 'listening', 'device': device_name})
+        next_state_q.put('listening')
+        return
+
+    reply = _query_openclaw(text)
+    if reply:
+        print(f'[BOT] reply: {reply!r}', flush=True)
+        _push({'type': 'bot_message', 'text': reply})
+
+    # Stay in conversation — pipeline will record next turn without wakeword.
+    next_state_q.put('recording')
 
 
 # ── main audio/pipeline thread ─────────────────────────────────────────────────
@@ -245,6 +283,24 @@ def pipeline_thread() -> None:
             except queue.Empty:
                 continue
 
+            # Worker thread may have signalled the next state while we were
+            # thinking — apply it before processing the incoming chunk.
+            if state == 'thinking':
+                try:
+                    nxt = next_state_q.get_nowait()
+                except queue.Empty:
+                    continue  # still processing, discard audio
+                if nxt == 'recording':
+                    print('[CONVERSATION] continuing — next turn', flush=True)
+                    command_buf = []
+                    silence_chunks = 0
+                    state = 'recording'
+                    _push({'type': 'state', 'state': 'recording'})
+                else:
+                    state = 'listening'
+                    _push({'type': 'state', 'state': 'listening', 'device': device_name})
+                continue
+
             rms = float(np.sqrt(np.mean(np.square(chunk.astype(np.float32) / 32768.0))))
 
             if state == 'listening':
@@ -256,7 +312,7 @@ def pipeline_thread() -> None:
                 now = time.monotonic()
                 if score >= WAKEWORD_THRESHOLD and (now - last_trigger) >= TRIGGER_COOLDOWN:
                     last_trigger = now
-                    print(f'[WAKEWORD] Triggered! score={score:.4f}', flush=True)
+                    print(f'[WAKEWORD] Triggered! score={score:.4f} — entering conversation', flush=True)
                     state = 'recording'
                     command_buf = []
                     silence_chunks = 0
@@ -278,7 +334,7 @@ def pipeline_thread() -> None:
                     print(f'[VAD] stop ({reason}) elapsed={elapsed:.2f}s silence={silence_elapsed:.2f}s', flush=True)
                     audio = np.concatenate(command_buf).astype(np.int16)
                     _push({'type': 'state', 'state': 'thinking'})
-                    state = 'listening'   # resume wakeword detection immediately
+                    state = 'thinking'
                     threading.Thread(
                         target=_respond_worker,
                         args=(audio, device_name),
