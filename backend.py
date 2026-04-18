@@ -65,8 +65,9 @@ TRIGGER_COOLDOWN = 3.0   # min seconds between back-to-back triggers
 MIN_COMMAND_SECONDS = 1.0
 MAX_COMMAND_SECONDS = 12.0
 SILENCE_HANG_SECONDS = 0.9
-SPEECH_START_RMS_THRESHOLD = 0.012
-SILENCE_RMS_THRESHOLD = 0.009
+SPEECH_START_RMS_THRESHOLD = 0.16
+SILENCE_RMS_THRESHOLD = 0.12
+ASSISTANT_IDLE_WINDOW_SECONDS = 2.0
 
 WAKEWORD_MODEL_ONNX = BMO_MODEL_DIR / 'hey_bee_moh.onnx'
 WAKEWORD_FEATURE_DIR = BMO_MODEL_DIR / 'resources'
@@ -211,9 +212,10 @@ def _session_file_for_key(session_key: str) -> Path | None:
         return None
 
 
-def _read_new_assistant_reply(session_file: Path | None, start_offset: int) -> str:
+def _read_new_assistant_replies(session_file: Path | None, start_offset: int) -> tuple[list[str], int]:
+    replies: list[str] = []
     if not session_file or not session_file.exists():
-        return ''
+        return replies, start_offset
     try:
         with session_file.open('r', encoding='utf-8') as fh:
             fh.seek(start_offset)
@@ -231,16 +233,19 @@ def _read_new_assistant_reply(session_file: Path | None, start_offset: int) -> s
                 if msg.get('role') != 'assistant':
                     continue
                 content = _extract_text(msg.get('content', ''))
-                if content:
-                    return content.replace('[[reply_to_current]]', '').strip()
+                cleaned = content.replace('[[reply_to_current]]', '').strip() if content else ''
+                if cleaned:
+                    replies.append(cleaned)
+            new_offset = fh.tell()
+        return replies, new_offset
     except Exception as exc:
         print(f'[OPENCLAW] session file read failed: {exc}', flush=True)
-    return ''
+        return [], start_offset
 
 
-def _query_openclaw(text: str) -> str:
+def _query_openclaw(text: str) -> list[str]:
     if not OPENCLAW_SESSION_KEY:
-        return ''
+        return []
 
     idempotency_key = f'bmo-orb-{uuid.uuid4()}'
 
@@ -259,24 +264,31 @@ def _query_openclaw(text: str) -> str:
         )
         if result.returncode != 0:
             print(f'[OPENCLAW] chat.send failed: {result.stderr.strip() or result.stdout.strip()}', flush=True)
-            return ''
+            return []
 
         stdout = result.stdout.strip()
         if stdout:
             print(f'[OPENCLAW] chat.send -> {stdout}', flush=True)
 
         deadline = time.monotonic() + max(15, OPENCLAW_TIMEOUT_MS / 1000)
+        replies: list[str] = []
+        last_reply_at: float | None = None
         while time.monotonic() < deadline:
-            reply = _read_new_assistant_reply(session_file, start_offset)
-            if reply:
-                return reply
-            time.sleep(0.8)
+            new_replies, start_offset = _read_new_assistant_replies(session_file, start_offset)
+            if new_replies:
+                replies.extend(new_replies)
+                last_reply_at = time.monotonic()
+            if replies and last_reply_at and (time.monotonic() - last_reply_at) >= ASSISTANT_IDLE_WINDOW_SECONDS:
+                return replies
+            time.sleep(0.5)
 
+        if replies:
+            return replies
         print('[OPENCLAW] no assistant reply found before timeout', flush=True)
-        return ''
+        return []
     except Exception as exc:
         print(f'[OPENCLAW] {exc}', flush=True)
-        return ''
+        return []
 
 
 # ── broadcast helper ───────────────────────────────────────────────────────────
@@ -327,10 +339,11 @@ def _respond_worker(audio: np.ndarray, device_name: str) -> None:
             next_state_q.put('listening')
             return
 
-        reply = _query_openclaw(text)
-        print(f'[OPENCLAW] reply -> {reply!r}', flush=True)
-        if reply:
-            _push({'type': 'bot_message', 'text': reply})
+        replies = _query_openclaw(text)
+        print(f'[OPENCLAW] replies -> {replies!r}', flush=True)
+        if replies:
+            for reply in replies:
+                _push({'type': 'bot_message', 'text': reply})
         else:
             print('[OPENCLAW] empty reply or endpoint unavailable', flush=True)
 
