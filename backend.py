@@ -2,16 +2,16 @@
 import asyncio
 import json
 import queue
+import subprocess
 import threading
 from pathlib import Path
 
 import numpy as np
-import sounddevice as sd
+import openwakeword
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from openwakeword.model import Model
-import openwakeword
 
 APP_DIR = Path(__file__).resolve().parent
 MIC_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=20)
@@ -26,48 +26,67 @@ TRIGGER_THRESHOLD = 0.5
 TARGET_MODEL = 'hey_jarvis'
 
 
-def audio_callback(indata, frames, time, status):
-    if status:
-        return
-    audio = indata[:, 0].copy()
-    level = float(np.sqrt(np.mean(np.square(audio))))
-    pcm16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-    scores = model.predict(pcm16)
-    score = 0.0
-    for key, value in scores.items():
-      if TARGET_MODEL in key.replace(' ', '_').lower() or 'jarvis' in key.lower():
-        score = float(value)
-        break
-    payload = {
-        'level': round(level, 4),
-        'score': round(score, 4),
-        'detected': score >= TRIGGER_THRESHOLD,
-    }
-    try:
-        MIC_QUEUE.put_nowait(payload)
-    except queue.Full:
-        try:
-            MIC_QUEUE.get_nowait()
-        except queue.Empty:
-            pass
-        MIC_QUEUE.put_nowait(payload)
-
-
-def start_audio_stream():
-    devices = sd.query_devices()
-    input_device = None
-    for idx, device in enumerate(devices):
-        if device['max_input_channels'] > 0 and 'USB' in device['name']:
-            input_device = idx
+def pick_arecord_device() -> str:
+    result = subprocess.run(['arecord', '-l'], capture_output=True, text=True, check=False)
+    usb_line = None
+    for line in result.stdout.splitlines():
+        if 'USB' in line or 'Usb Audio Device' in line:
+            usb_line = line
             break
-    if input_device is None:
-        for idx, device in enumerate(devices):
-            if device['max_input_channels'] > 0:
-                input_device = idx
-                break
-    stream = sd.InputStream(device=input_device, channels=1, samplerate=16000, callback=audio_callback, blocksize=1280, dtype='float32')
-    stream.start()
-    return stream, devices[input_device]['name'] if input_device is not None else 'Unknown'
+    if not usb_line:
+        return 'default'
+    import re
+    match = re.search(r'card (\d+):.*device (\d+):', usb_line)
+    if not match:
+        return 'default'
+    return f'hw:{match.group(1)},{match.group(2)}'
+
+
+def audio_loop():
+    device = pick_arecord_device()
+    cmd = [
+        'arecord',
+        '-D', device,
+        '-q',
+        '-r', '16000',
+        '-f', 'S16_LE',
+        '-c', '1',
+        '-t', 'raw'
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            chunk = proc.stdout.read(1280 * 2)
+            if not chunk:
+                continue
+            pcm16 = np.frombuffer(chunk, dtype=np.int16)
+            if pcm16.size == 0:
+                continue
+            float_audio = pcm16.astype(np.float32) / 32768.0
+            level = float(np.sqrt(np.mean(np.square(float_audio))))
+            scores = model.predict(pcm16)
+            score = 0.0
+            for key, value in scores.items():
+                key_norm = key.replace(' ', '_').lower()
+                if TARGET_MODEL in key_norm or 'jarvis' in key_norm:
+                    score = float(value)
+                    break
+            payload = {
+                'level': round(level, 4),
+                'score': round(score, 4),
+                'detected': score >= TRIGGER_THRESHOLD,
+                'device': device,
+            }
+            try:
+                MIC_QUEUE.put_nowait(payload)
+            except queue.Full:
+                try:
+                    MIC_QUEUE.get_nowait()
+                except queue.Empty:
+                    pass
+                MIC_QUEUE.put_nowait(payload)
+    finally:
+        proc.terminate()
 
 
 @app.get('/')
@@ -87,14 +106,16 @@ async def ws_endpoint(ws: WebSocket):
         CLIENTS.discard(ws)
 
 
-async def broadcaster(device_name: str):
+async def broadcaster():
     detected_hold = 0
+    last_device = 'unknown'
     while True:
         await asyncio.sleep(0.05)
         try:
             data = MIC_QUEUE.get_nowait()
         except queue.Empty:
             continue
+        last_device = data['device']
         if data['detected']:
             detected_hold = 20
         elif detected_hold > 0:
@@ -104,7 +125,7 @@ async def broadcaster(device_name: str):
             'type': 'audio_level',
             'level': data['level'],
             'heard': 'hey jarvis' if detected_hold > 0 else '--',
-            'device': device_name,
+            'device': last_device,
             'wake': wake_state,
             'score': data['score'],
         })
@@ -118,16 +139,7 @@ async def broadcaster(device_name: str):
             CLIENTS.discard(ws)
 
 
-def run_audio_loop():
-    stream, device_name = start_audio_stream()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(broadcaster(device_name))
-    try:
-        loop.run_forever()
-    finally:
-        stream.stop()
-        stream.close()
-
-
-threading.Thread(target=run_audio_loop, daemon=True).start()
+@app.on_event('startup')
+async def startup_event():
+    threading.Thread(target=audio_loop, daemon=True).start()
+    asyncio.create_task(broadcaster())
