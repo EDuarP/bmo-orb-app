@@ -7,29 +7,25 @@
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
+    <!-- top HUD -->
     <div class="hud">
-      <div class="brand"></div>
+      <div class="brand">BMO</div>
       <div class="status-group">
-        <span id="mic-status">Mic: waiting</span>
-        <span id="wake-status">Wake word: idle</span>
-        <span id="heard-status">Heard: --</span>
+        <span id="state-badge" data-state="listening">Listening</span>
         <span id="level-status">Level: --</span>
-        <span>Exit: Alt+F4 or F11</span>
+        <span id="score-status">Score: --</span>
+        <span>Exit: Alt+F4</span>
       </div>
     </div>
 
+    <!-- orb canvas (background) -->
     <canvas id="orb"></canvas>
 
-    <div class="center-copy">
-      <p class="eyebrow">Voice Interface</p>
-      <h1></h1>
-      <p></p>
-    </div>
+    <!-- conversation bubbles — bot messages persist here -->
+    <div class="bubbles" id="bubbles"></div>
 
-    <div class="debug-panel">
-      <div class="debug-title">Live transcription debug</div>
-      <div id="transcript-log" class="debug-log">Waiting for speech recognition...</div>
-    </div>
+    <!-- small label: what Whisper heard -->
+    <div class="transcript" id="transcript"></div>
 
     <script src="/static/app.js"></script>
   </body>

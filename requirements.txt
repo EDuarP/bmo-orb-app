@@ -2,3 +2,6 @@ fastapi
 uvicorn[standard]
 sounddevice
 numpy
+openwakeword
+# faster-whisper lives in .venv-audio — install there separately
+# system dep: sudo apt-get install portaudio19-dev libportaudio2
