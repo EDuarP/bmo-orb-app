@@ -4,6 +4,7 @@ const micStatus = document.getElementById('mic-status');
 const wakeStatus = document.getElementById('wake-status');
 const heardStatus = document.getElementById('heard-status');
 const levelStatus = document.getElementById('level-status');
+const transcriptLog = document.getElementById('transcript-log');
 
 let w = canvas.width = window.innerWidth;
 let h = canvas.height = window.innerHeight;
@@ -41,7 +42,10 @@ function setupWakeWord() {
       transcript += event.results[i][0].transcript + ' ';
     }
     transcript = transcript.trim();
-    if (transcript) heardStatus.textContent = `Heard: ${transcript}`;
+    if (transcript) {
+      heardStatus.textContent = `Heard: ${transcript}`;
+      transcriptLog.textContent = transcript;
+    }
     if (/ey\s*bmo/i.test(transcript)) {
       wakeStatus.textContent = 'Wake word: detected';
       targetLevel = 0.95;
@@ -54,10 +58,12 @@ function setupWakeWord() {
 
   recognition.onerror = () => {
     wakeStatus.textContent = 'Wake word: reconnecting';
+    transcriptLog.textContent = 'Speech recognition error, reconnecting...';
   };
 
   recognition.onend = () => {
     wakeStatus.textContent = 'Wake word: reconnecting';
+    transcriptLog.textContent = 'Speech recognition ended, reconnecting...';
     setTimeout(() => recognition.start(), 3000);
   };
 
