@@ -7,22 +7,47 @@ import threading
 from pathlib import Path
 
 import numpy as np
-import openwakeword
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from openwakeword.model import Model
 
 APP_DIR = Path(__file__).resolve().parent
+BMO_MODEL_DIR = Path('/home/eduarp/.openclaw/workspace/repos/BMO/openWakeWordModel')
 MIC_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=20)
 CLIENTS: set[WebSocket] = set()
+
+WAKEWORD_THRESHOLD = 0.4
+CHUNK_SAMPLES = 32000  # 2 seconds at 16 kHz, matching BMO chunk_sec=2
+WAKEWORD_MODEL_TFLITE = BMO_MODEL_DIR / 'hey_bee_moh.tflite'
+WAKEWORD_MODEL_ONNX = BMO_MODEL_DIR / 'hey_bee_moh.onnx'
+WAKEWORD_FEATURE_MODELS_DIR = BMO_MODEL_DIR / 'resources'
 
 app = FastAPI()
 app.mount('/static', StaticFiles(directory=str(APP_DIR)), name='static')
 
-model = Model(wakeword_model_paths=[p for p in openwakeword.get_pretrained_model_paths() if 'hey_jarvis' in p])
-TRIGGER_THRESHOLD = 0.5
-TARGET_MODEL = 'hey_jarvis'
+
+def load_wakeword_model():
+    model_path = WAKEWORD_MODEL_ONNX
+    if not model_path.exists():
+        raise FileNotFoundError(f'Missing wakeword model: {model_path}')
+
+    melspec_model_path = WAKEWORD_FEATURE_MODELS_DIR / 'melspectrogram.onnx'
+    embedding_model_path = WAKEWORD_FEATURE_MODELS_DIR / 'embedding_model.onnx'
+
+    if not melspec_model_path.exists() or not embedding_model_path.exists():
+        raise FileNotFoundError('Missing openWakeWord feature models in BMO resources')
+
+    model = Model(
+        wakeword_model_paths=[str(model_path)],
+        melspec_onnx_model_path=str(melspec_model_path),
+        embedding_onnx_model_path=str(embedding_model_path),
+    )
+    model_name = next(iter(model.models.keys()))
+    return model, model_name
+
+
+wakeword_model, wakeword_name = load_wakeword_model()
 
 
 def pick_arecord_device() -> str:
@@ -43,16 +68,9 @@ def pick_arecord_device() -> str:
 
 def audio_loop():
     device = pick_arecord_device()
-    cmd = [
-        'arecord',
-        '-D', device,
-        '-q',
-        '-r', '16000',
-        '-f', 'S16_LE',
-        '-c', '1',
-        '-t', 'raw'
-    ]
+    cmd = ['arecord', '-D', device, '-q', '-r', '16000', '-f', 'S16_LE', '-c', '1', '-t', 'raw']
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    buffer = np.array([], dtype=np.int16)
     try:
         while True:
             chunk = proc.stdout.read(1280 * 2)
@@ -61,19 +79,21 @@ def audio_loop():
             pcm16 = np.frombuffer(chunk, dtype=np.int16)
             if pcm16.size == 0:
                 continue
-            float_audio = pcm16.astype(np.float32) / 32768.0
+            buffer = np.concatenate([buffer, pcm16])
+            if buffer.size < CHUNK_SAMPLES:
+                continue
+
+            audio_i16 = buffer[:CHUNK_SAMPLES]
+            buffer = buffer[-1280:]  # keep small overlap for continuity
+            float_audio = audio_i16.astype(np.float32) / 32768.0
             level = float(np.sqrt(np.mean(np.square(float_audio))))
-            scores = model.predict(pcm16)
-            score = 0.0
-            for key, value in scores.items():
-                key_norm = key.replace(' ', '_').lower()
-                if TARGET_MODEL in key_norm or 'jarvis' in key_norm:
-                    score = float(value)
-                    break
+            prediction = wakeword_model.predict(audio_i16)
+            score = float(prediction.get(wakeword_name, next(iter(prediction.values()), 0.0)))
+
             payload = {
                 'level': round(level, 4),
                 'score': round(score, 4),
-                'detected': score >= TRIGGER_THRESHOLD,
+                'detected': score >= WAKEWORD_THRESHOLD,
                 'device': device,
             }
             try:
@@ -105,7 +125,7 @@ def app_js():
 
 @app.get('/favicon.ico')
 def favicon():
-    return FileResponse(APP_DIR / 'favicon.ico') if (APP_DIR / 'favicon.ico').exists() else FileResponse(APP_DIR / 'index.html')
+    return FileResponse(APP_DIR / 'index.html')
 
 
 @app.websocket('/ws')
@@ -113,7 +133,7 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     CLIENTS.add(ws)
     try:
-        await ws.send_text(json.dumps({'type': 'status', 'mic': 'live', 'wake': 'hey jarvis armed'}))
+        await ws.send_text(json.dumps({'type': 'status', 'mic': 'live', 'wake': 'hey bemo armed'}))
         while True:
             await asyncio.sleep(1)
     except WebSocketDisconnect:
@@ -122,14 +142,12 @@ async def ws_endpoint(ws: WebSocket):
 
 async def broadcaster():
     detected_hold = 0
-    last_device = 'unknown'
     while True:
         await asyncio.sleep(0.05)
         try:
             data = MIC_QUEUE.get_nowait()
         except queue.Empty:
             continue
-        last_device = data['device']
         if data['detected']:
             detected_hold = 20
         elif detected_hold > 0:
@@ -138,8 +156,8 @@ async def broadcaster():
         payload = json.dumps({
             'type': 'audio_level',
             'level': data['level'],
-            'heard': 'hey jarvis' if detected_hold > 0 else '--',
-            'device': last_device,
+            'heard': 'hey bemo' if detected_hold > 0 else '--',
+            'device': data['device'],
             'wake': wake_state,
             'score': data['score'],
         })
