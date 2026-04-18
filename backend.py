@@ -19,7 +19,8 @@ MIC_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=20)
 CLIENTS: set[WebSocket] = set()
 
 WAKEWORD_THRESHOLD = 0.4
-CHUNK_SAMPLES = 32000  # 2 seconds at 16 kHz, matching BMO chunk_sec=2
+CHUNK_SECONDS = 5
+CHUNK_SAMPLES = 16000 * CHUNK_SECONDS
 WAKEWORD_MODEL_TFLITE = BMO_MODEL_DIR / 'hey_bee_moh.tflite'
 WAKEWORD_MODEL_ONNX = BMO_MODEL_DIR / 'hey_bee_moh.onnx'
 WAKEWORD_FEATURE_MODELS_DIR = BMO_MODEL_DIR / 'resources'
@@ -94,6 +95,7 @@ def audio_loop():
                     last_log = time.time()
                 continue
 
+            print(f'GRABANDO', flush=True)
             audio_i16 = buffer[:CHUNK_SAMPLES]
             buffer = buffer[-1280:]  # keep small overlap for continuity
             float_audio = audio_i16.astype(np.float32) / 32768.0
@@ -101,6 +103,7 @@ def audio_loop():
             print(f'[AUDIO] frame={frame_counter} level={level:.4f} max={float(np.max(np.abs(float_audio))):.4f}', flush=True)
             prediction = wakeword_model.predict(audio_i16)
             score = float(prediction.get(wakeword_name, next(iter(prediction.values()), 0.0)))
+            print(f'FIN DE GRABADO {CHUNK_SECONDS:.1f}s', flush=True)
             print(f"[WAKEWORD] model={wakeword_name} score={score:.4f} threshold={WAKEWORD_THRESHOLD:.2f} detected={score >= WAKEWORD_THRESHOLD}", flush=True)
 
             payload = {
