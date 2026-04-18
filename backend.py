@@ -3,8 +3,10 @@ import asyncio
 import json
 import queue
 import subprocess
+import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -15,11 +17,13 @@ from openwakeword.model import Model
 
 APP_DIR = Path(__file__).resolve().parent
 BMO_MODEL_DIR = Path('/home/eduarp/.openclaw/workspace/repos/BMO/openWakeWordModel')
+WHISPER_VENV_PYTHON = '/home/eduarp/.openclaw/workspace/.venv-audio/bin/python'
+WHISPER_MODEL_PATH = '/home/eduarp/.openclaw/workspace/models/whisper-small'
 MIC_QUEUE: "queue.Queue[dict]" = queue.Queue(maxsize=20)
 CLIENTS: set[WebSocket] = set()
 
 WAKEWORD_THRESHOLD = 0.4
-CHUNK_SECONDS = 5
+CHUNK_SECONDS = 3
 CHUNK_SAMPLES = 16000 * CHUNK_SECONDS
 WAKEWORD_MODEL_ONNX = BMO_MODEL_DIR / 'hey_bee_moh.onnx'
 WAKEWORD_FEATURE_MODELS_DIR = BMO_MODEL_DIR / 'resources'
@@ -67,16 +71,36 @@ def pick_arecord_device() -> str:
     return f'hw:{match.group(1)},{match.group(2)}'
 
 
+def write_wav(path: str, pcm16: np.ndarray):
+    with wave.open(path, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(pcm16.astype(np.int16).tobytes())
+
+
+def transcribe_with_whisper(wav_path: str) -> str:
+    cmd = [
+        WHISPER_VENV_PYTHON,
+        '-c',
+        (
+            'from faster_whisper import WhisperModel; '
+            f'm=WhisperModel("{WHISPER_MODEL_PATH}", device="cpu", compute_type="int8"); '
+            f'seg,_=m.transcribe("{wav_path}", language="en"); '
+            'print(" ".join(s.text.strip() for s in seg).strip())'
+        )
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        print(f'[WHISPER] error code={result.returncode} stderr={result.stderr.strip()}', flush=True)
+        return ''
+    return result.stdout.strip()
+
+
 def record_block_arecord(device: str, seconds: int) -> np.ndarray:
     cmd = [
-        'arecord',
-        '-D', device,
-        '-q',
-        '-d', str(seconds),
-        '-r', '16000',
-        '-f', 'S16_LE',
-        '-c', '1',
-        '-t', 'raw',
+        'arecord', '-D', device, '-q', '-d', str(seconds),
+        '-r', '16000', '-f', 'S16_LE', '-c', '1', '-t', 'raw'
     ]
     started_at = time.time()
     print('GRABANDO', flush=True)
@@ -85,8 +109,7 @@ def record_block_arecord(device: str, seconds: int) -> np.ndarray:
     print(f'FIN DE GRABADO {elapsed:.3f}s', flush=True)
     if proc.returncode != 0:
         print(f'[AUDIO] arecord returned code {proc.returncode}', flush=True)
-    pcm16 = np.frombuffer(proc.stdout, dtype=np.int16)
-    return pcm16
+    return np.frombuffer(proc.stdout, dtype=np.int16)
 
 
 def audio_loop():
@@ -99,12 +122,24 @@ def audio_loop():
             continue
         if pcm16.size != CHUNK_SAMPLES:
             print(f'[AUDIO] Expected {CHUNK_SAMPLES} samples, got {pcm16.size}', flush=True)
+            if pcm16.size < CHUNK_SAMPLES:
+                continue
+            pcm16 = pcm16[:CHUNK_SAMPLES]
 
-        audio_i16 = pcm16[:CHUNK_SAMPLES]
-        float_audio = audio_i16.astype(np.float32) / 32768.0
+        float_audio = pcm16.astype(np.float32) / 32768.0
         level = float(np.sqrt(np.mean(np.square(float_audio))))
         print(f'[AUDIO] level={level:.4f} max={float(np.max(np.abs(float_audio))):.4f}', flush=True)
-        prediction = wakeword_model.predict(audio_i16)
+
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            wav_path = tmp.name
+        try:
+            write_wav(wav_path, pcm16)
+            transcript = transcribe_with_whisper(wav_path)
+        finally:
+            Path(wav_path).unlink(missing_ok=True)
+
+        print(f'[WHISPER] transcript={transcript or "--"}', flush=True)
+        prediction = wakeword_model.predict(pcm16)
         score = float(prediction.get(wakeword_name, next(iter(prediction.values()), 0.0)))
         print(f"[WAKEWORD] model={wakeword_name} score={score:.4f} threshold={WAKEWORD_THRESHOLD:.2f} detected={score >= WAKEWORD_THRESHOLD}", flush=True)
 
@@ -113,6 +148,7 @@ def audio_loop():
             'score': round(score, 4),
             'detected': score >= WAKEWORD_THRESHOLD,
             'device': device,
+            'heard': transcript or '--',
         }
         try:
             MIC_QUEUE.put_nowait(payload)
@@ -172,7 +208,7 @@ async def broadcaster():
         payload = json.dumps({
             'type': 'audio_level',
             'level': data['level'],
-            'heard': '--',
+            'heard': data['heard'],
             'device': data['device'],
             'wake': wake_state,
             'score': data['score'],
