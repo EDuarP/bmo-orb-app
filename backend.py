@@ -49,6 +49,7 @@ WHISPER_MODEL_PATH = '/home/eduarp/.openclaw/workspace/models/whisper-small'
 # ── OpenClaw integration ───────────────────────────────────────────────────────
 OPENCLAW_SESSION_KEY = os.getenv('OPENCLAW_SESSION_KEY', 'agent:main:main')
 OPENCLAW_TIMEOUT_MS = int(os.getenv('OPENCLAW_TIMEOUT_MS', '45000'))
+OPENCLAW_SESSIONS_INDEX = Path('/home/eduarp/.openclaw/agents/main/sessions/sessions.json')
 
 # ── audio / model config ───────────────────────────────────────────────────────
 TARGET_SAMPLE_RATE = 16000
@@ -60,11 +61,12 @@ CHUNK_SECONDS = WAKEWORD_CHUNK / TARGET_SAMPLE_RATE   # 0.08 s per chunk
 WAKEWORD_THRESHOLD = 0.5
 TRIGGER_COOLDOWN = 3.0   # min seconds between back-to-back triggers
 
-# VAD: after wakeword triggers, record until user stops talking.
-MIN_COMMAND_SECONDS = 1.5   # ignore silence before this floor
-MAX_COMMAND_SECONDS = 10.0  # hard cap
-SILENCE_HANG_SECONDS = 0.8  # stop after this much continuous silence
-SILENCE_RMS_THRESHOLD = 0.01
+# VAD: after wakeword triggers, match BMO repo energy endpointing more closely.
+MIN_COMMAND_SECONDS = 1.0
+MAX_COMMAND_SECONDS = 12.0
+SILENCE_HANG_SECONDS = 0.9
+SPEECH_START_RMS_THRESHOLD = 0.012
+SILENCE_RMS_THRESHOLD = 0.009
 
 WAKEWORD_MODEL_ONNX = BMO_MODEL_DIR / 'hey_bee_moh.onnx'
 WAKEWORD_FEATURE_DIR = BMO_MODEL_DIR / 'resources'
@@ -185,38 +187,76 @@ def _extract_text(node) -> str:
     return ''
 
 
+def _run_gateway_call(method: str, params: dict, timeout_ms: int) -> subprocess.CompletedProcess:
+    cmd = (
+        'source ~/.nvm/nvm.sh && nvm use 22 >/dev/null && '
+        f'openclaw gateway call {method} --json --timeout {timeout_ms} '
+        f'--params {json.dumps(json.dumps(params))}'
+    )
+    return subprocess.run(
+        ['bash', '-lc', cmd],
+        capture_output=True,
+        text=True,
+        timeout=max(20, int(timeout_ms / 1000) + 5),
+    )
+
+
+def _session_file_for_key(session_key: str) -> Path | None:
+    try:
+        data = json.loads(OPENCLAW_SESSIONS_INDEX.read_text())
+        session_file = data.get(session_key, {}).get('sessionFile')
+        return Path(session_file) if session_file else None
+    except Exception as exc:
+        print(f'[OPENCLAW] session file lookup failed: {exc}', flush=True)
+        return None
+
+
+def _read_new_assistant_reply(session_file: Path | None, start_offset: int) -> str:
+    if not session_file or not session_file.exists():
+        return ''
+    try:
+        with session_file.open('r', encoding='utf-8') as fh:
+            fh.seek(start_offset)
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if entry.get('type') != 'message':
+                    continue
+                msg = entry.get('message', {})
+                if msg.get('role') != 'assistant':
+                    continue
+                content = _extract_text(msg.get('content', ''))
+                if content:
+                    return content.replace('[[reply_to_current]]', '').strip()
+    except Exception as exc:
+        print(f'[OPENCLAW] session file read failed: {exc}', flush=True)
+    return ''
+
+
 def _query_openclaw(text: str) -> str:
     if not OPENCLAW_SESSION_KEY:
         return ''
 
     idempotency_key = f'bmo-orb-{uuid.uuid4()}'
-    params = json.dumps({
-        'sessionKey': OPENCLAW_SESSION_KEY,
-        'message': text,
-        'idempotencyKey': idempotency_key,
-    })
 
     try:
-        history_cmd = (
-            'source ~/.nvm/nvm.sh && nvm use 22 >/dev/null && '
-            'openclaw gateway call chat.history --json '
-            f'--params {json.dumps(json.dumps({"sessionKey": OPENCLAW_SESSION_KEY}))} --timeout 5000'
-        )
+        session_file = _session_file_for_key(OPENCLAW_SESSION_KEY)
+        start_offset = session_file.stat().st_size if session_file and session_file.exists() else 0
 
-        baseline_count = 0
-        hist0 = subprocess.run(['bash', '-lc', history_cmd], capture_output=True, text=True, timeout=10)
-        if hist0.returncode == 0 and hist0.stdout.strip():
-            try:
-                baseline_count = len(json.loads(hist0.stdout).get('messages', []))
-            except Exception:
-                baseline_count = 0
-
-        cmd = (
-            'source ~/.nvm/nvm.sh && nvm use 22 >/dev/null && '
-            f'openclaw gateway call chat.send --json --timeout {OPENCLAW_TIMEOUT_MS} '
-            f'--params {json.dumps(params)}'
+        result = _run_gateway_call(
+            'chat.send',
+            {
+                'sessionKey': OPENCLAW_SESSION_KEY,
+                'message': text,
+                'idempotencyKey': idempotency_key,
+            },
+            OPENCLAW_TIMEOUT_MS,
         )
-        result = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=(OPENCLAW_TIMEOUT_MS / 1000) + 10)
         if result.returncode != 0:
             print(f'[OPENCLAW] chat.send failed: {result.stderr.strip() or result.stdout.strip()}', flush=True)
             return ''
@@ -225,23 +265,12 @@ def _query_openclaw(text: str) -> str:
         if stdout:
             print(f'[OPENCLAW] chat.send -> {stdout}', flush=True)
 
-        deadline = time.monotonic() + max(12, OPENCLAW_TIMEOUT_MS / 1000)
+        deadline = time.monotonic() + max(15, OPENCLAW_TIMEOUT_MS / 1000)
         while time.monotonic() < deadline:
-            hist = subprocess.run(['bash', '-lc', history_cmd], capture_output=True, text=True, timeout=10)
-            if hist.returncode == 0 and hist.stdout.strip():
-                try:
-                    payload = json.loads(hist.stdout)
-                    messages = payload.get('messages', [])
-                    new_messages = messages[baseline_count:]
-                    for msg in reversed(new_messages):
-                        if msg.get('role') != 'assistant':
-                            continue
-                        content = _extract_text(msg.get('content', ''))
-                        if content and content != 'Hey, ya estoy activo ✅':
-                            return content
-                except Exception as exc:
-                    print(f'[OPENCLAW] history parse error: {exc}', flush=True)
-            time.sleep(1.0)
+            reply = _read_new_assistant_reply(session_file, start_offset)
+            if reply:
+                return reply
+            time.sleep(0.8)
 
         print('[OPENCLAW] no assistant reply found before timeout', flush=True)
         return ''
@@ -357,6 +386,7 @@ def pipeline_thread() -> None:
 
             state = 'listening'
             command_buf: list[np.ndarray] = []
+            speech_started = False
             silence_chunks = 0
 
             while True:
@@ -377,6 +407,7 @@ def pipeline_thread() -> None:
                     if nxt == 'recording':
                         print('[CONVERSATION] continuing — next turn', flush=True)
                         command_buf = []
+                        speech_started = False
                         silence_chunks = 0
                         state = 'recording'
                         _push({'type': 'state', 'state': 'recording'})
@@ -397,13 +428,22 @@ def pipeline_thread() -> None:
                         print(f'[WAKEWORD] Triggered! score={score:.4f} — entrando a modo conversación', flush=True)
                         state = 'recording'
                         command_buf = []
+                        speech_started = False
                         silence_chunks = 0
                         _push({'type': 'state', 'state': 'recording'})
 
                 elif state == 'recording':
-                    command_buf.append(chunk)
                     _push({'type': 'audio_level', 'level': round(rms, 4), 'score': 0.0})
 
+                    if not speech_started:
+                        if rms >= SPEECH_START_RMS_THRESHOLD:
+                            speech_started = True
+                            command_buf = [chunk]
+                            silence_chunks = 0
+                            print(f'[REC] speech started rms={rms:.4f}', flush=True)
+                        continue
+
+                    command_buf.append(chunk)
                     silence_chunks = silence_chunks + 1 if rms < SILENCE_RMS_THRESHOLD else 0
 
                     elapsed = len(command_buf) * CHUNK_SECONDS
@@ -418,6 +458,9 @@ def pipeline_thread() -> None:
                         reason = 'max' if hit_max else 'silence'
                         print(f'[VAD] stop ({reason}) elapsed={elapsed:.2f}s silence={silence_elapsed:.2f}s', flush=True)
                         audio = np.concatenate(command_buf).astype(np.int16)
+                        command_buf = []
+                        speech_started = False
+                        silence_chunks = 0
                         _push({'type': 'state', 'state': 'thinking'})
                         state = 'thinking'
                         threading.Thread(
