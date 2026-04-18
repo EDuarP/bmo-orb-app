@@ -47,7 +47,7 @@ WHISPER_MODEL_PATH = '/home/eduarp/.openclaw/workspace/models/whisper-small'
 # ── OpenClaw integration ───────────────────────────────────────────────────────
 # POST {"message": "..."} → expects {"reply": "..."}
 # Leave as '' to skip bot query and only show transcription.
-OPENCLAW_URL = ''
+OPENCLAW_URL = 'http://127.0.0.1:18789'
 
 # ── audio / model config ───────────────────────────────────────────────────────
 TARGET_SAMPLE_RATE = 16000
@@ -55,10 +55,15 @@ TARGET_SAMPLE_RATE = 16000
 # Passing larger chunks causes the model to evaluate only the LAST window and
 # miss detections earlier in the block. Always feed exactly 1280 samples.
 WAKEWORD_CHUNK = 1280
-COMMAND_SECONDS = 5
-COMMAND_SAMPLES = TARGET_SAMPLE_RATE * COMMAND_SECONDS
+CHUNK_SECONDS = WAKEWORD_CHUNK / TARGET_SAMPLE_RATE   # 0.08 s per chunk
 WAKEWORD_THRESHOLD = 0.5
 TRIGGER_COOLDOWN = 3.0   # min seconds between back-to-back triggers
+
+# VAD: after wakeword triggers, record until user stops talking.
+MIN_COMMAND_SECONDS = 1.5   # ignore silence before this floor
+MAX_COMMAND_SECONDS = 10.0  # hard cap
+SILENCE_HANG_SECONDS = 0.8  # stop after this much continuous silence
+SILENCE_RMS_THRESHOLD = 0.01
 
 WAKEWORD_MODEL_ONNX = BMO_MODEL_DIR / 'hey_bee_moh.onnx'
 WAKEWORD_FEATURE_DIR = BMO_MODEL_DIR / 'resources'
@@ -232,6 +237,7 @@ def pipeline_thread() -> None:
 
         state = 'listening'
         command_buf: list[np.ndarray] = []
+        silence_chunks = 0
 
         while True:
             try:
@@ -253,13 +259,23 @@ def pipeline_thread() -> None:
                     print(f'[WAKEWORD] Triggered! score={score:.4f}', flush=True)
                     state = 'recording'
                     command_buf = []
+                    silence_chunks = 0
                     _push({'type': 'state', 'state': 'recording'})
 
             elif state == 'recording':
                 command_buf.append(chunk)
                 _push({'type': 'audio_level', 'level': round(rms, 4), 'score': 0.0})
 
-                if len(command_buf) * WAKEWORD_CHUNK >= COMMAND_SAMPLES:
+                silence_chunks = silence_chunks + 1 if rms < SILENCE_RMS_THRESHOLD else 0
+
+                elapsed = len(command_buf) * CHUNK_SECONDS
+                silence_elapsed = silence_chunks * CHUNK_SECONDS
+                hit_max = elapsed >= MAX_COMMAND_SECONDS
+                hit_silence = elapsed >= MIN_COMMAND_SECONDS and silence_elapsed >= SILENCE_HANG_SECONDS
+
+                if hit_max or hit_silence:
+                    reason = 'max' if hit_max else 'silence'
+                    print(f'[VAD] stop ({reason}) elapsed={elapsed:.2f}s silence={silence_elapsed:.2f}s', flush=True)
                     audio = np.concatenate(command_buf).astype(np.int16)
                     _push({'type': 'state', 'state': 'thinking'})
                     state = 'listening'   # resume wakeword detection immediately
