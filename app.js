@@ -35,8 +35,8 @@ function connectBackend() {
       heardStatus.textContent = `Heard: ${payload.heard}`;
       levelStatus.textContent = `Level: ${payload.level.toFixed(3)} | Score: ${payload.score.toFixed(3)}`;
       transcriptLog.textContent = payload.wake === 'detected'
-        ? 'Wake word detected: hey jarvis'
-        : `Audio stream active from ${payload.device}. Listening for hey jarvis.`;
+        ? 'Wake word detected.'
+        : `Audio stream active from ${payload.device}. Listening.`;
     }
   };
   ws.onclose = () => {

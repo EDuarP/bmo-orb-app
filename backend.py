@@ -95,7 +95,8 @@ def audio_loop():
                     last_log = time.time()
                 continue
 
-            print(f'GRABANDO', flush=True)
+            record_started_at = time.time()
+            print('GRABANDO', flush=True)
             audio_i16 = buffer[:CHUNK_SAMPLES]
             buffer = buffer[-1280:]  # keep small overlap for continuity
             float_audio = audio_i16.astype(np.float32) / 32768.0
@@ -103,7 +104,8 @@ def audio_loop():
             print(f'[AUDIO] frame={frame_counter} level={level:.4f} max={float(np.max(np.abs(float_audio))):.4f}', flush=True)
             prediction = wakeword_model.predict(audio_i16)
             score = float(prediction.get(wakeword_name, next(iter(prediction.values()), 0.0)))
-            print(f'FIN DE GRABADO {CHUNK_SECONDS:.1f}s', flush=True)
+            record_elapsed = time.time() - record_started_at
+            print(f'FIN DE GRABADO {record_elapsed:.3f}s', flush=True)
             print(f"[WAKEWORD] model={wakeword_name} score={score:.4f} threshold={WAKEWORD_THRESHOLD:.2f} detected={score >= WAKEWORD_THRESHOLD}", flush=True)
 
             payload = {
