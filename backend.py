@@ -47,7 +47,7 @@ WHISPER_VENV_PYTHON = '/home/eduarp/.openclaw/workspace/.venv-audio/bin/python'
 WHISPER_MODEL_PATH = '/home/eduarp/.openclaw/workspace/models/whisper-small'
 
 # ── OpenClaw integration ───────────────────────────────────────────────────────
-OPENCLAW_SESSION_KEY = os.getenv('OPENCLAW_SESSION_KEY', 'agent:main:telegram:direct:8496015214')
+OPENCLAW_SESSION_KEY = os.getenv('OPENCLAW_SESSION_KEY', 'agent:main:main')
 OPENCLAW_TIMEOUT_MS = int(os.getenv('OPENCLAW_TIMEOUT_MS', '45000'))
 
 # ── audio / model config ───────────────────────────────────────────────────────
@@ -253,7 +253,6 @@ def _query_openclaw(text: str) -> str:
 # ── broadcast helper ───────────────────────────────────────────────────────────
 def _push(payload: dict) -> None:
     try:
-        print(f'[FRONT] queue -> {payload}', flush=True)
         broadcast_q.put_nowait(payload)
     except queue.Full:
         print('[FRONT] broadcast queue full, dropping oldest payload', flush=True)
