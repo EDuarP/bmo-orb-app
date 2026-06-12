@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# BMO helper: clima actual o pronóstico (wttr.in, sin API key).
+#   bmo-weather [ciudad]             → condiciones actuales
+#   bmo-weather pronostico [ciudad]  → hoy, mañana y pasado
+set -u
+
+MODE=now
+case "${1:-}" in
+  pronostico|pronóstico|forecast) MODE=fc; shift ;;
+esac
+LOC="${*:-}"
+LOC="${LOC// /+}"
+
+if [ "$MODE" = now ]; then
+  out=$(curl -s -m 10 "wttr.in/${LOC}?format=%l:+%C,+%t+(sensación+%f),+humedad+%h,+viento+%w&lang=es&m")
+  [ -n "$out" ] && echo "$out" || { echo "ERROR: servicio de clima no disponible"; exit 1; }
+else
+  curl -s -m 15 "wttr.in/${LOC}?format=j1&lang=es" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print('ERROR: servicio de clima no disponible'); raise SystemExit(1)
+area = d['nearest_area'][0]['areaName'][0]['value']
+names = ['Hoy', 'Mañana', 'Pasado mañana']
+print(f'Pronóstico para {area}:')
+for i, day in enumerate(d['weather'][:3]):
+    mid = day['hourly'][4]   # ~mediodía
+    desc = (mid.get('lang_es') or mid['weatherDesc'])[0]['value']
+    print(f\"- {names[i]}: {desc}, mín {day['mintempC']}°C / máx {day['maxtempC']}°C, prob. lluvia {mid['chanceofrain']}%\")
+"
+fi

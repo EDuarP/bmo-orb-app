@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -7,26 +7,8 @@
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <!-- top HUD -->
-    <div class="hud">
-      <div class="brand">BMO</div>
-      <div class="status-group">
-        <span id="state-badge" data-state="listening">Listening</span>
-        <span id="level-status">Level: --</span>
-        <span id="score-status">Score: --</span>
-        <span>Exit: Alt+F4</span>
-      </div>
-    </div>
-
-    <!-- orb canvas (background) -->
+    <!-- 3D particle orb (full-screen, no text) -->
     <canvas id="orb"></canvas>
-
-    <!-- conversation bubbles — bot messages persist here -->
-    <div class="bubbles" id="bubbles"></div>
-
-    <!-- small label: what Whisper heard -->
-    <div class="transcript" id="transcript"></div>
-
     <script src="/static/app.js"></script>
   </body>
 </html>

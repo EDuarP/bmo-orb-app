@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# BMO helper: calculadora y conversión de monedas.
+#   bmo-calc 25*4+10          → aritmética (sqrt, sin, log, pi…)
+#   bmo-calc 20% de 150       → porcentajes
+#   bmo-calc 100 usd a cop    → monedas (open.er-api.com, sin API key)
+set -u
+python3 - "$@" <<'EOF'
+import json, math, re, sys, urllib.request
+
+expr = ' '.join(sys.argv[1:]).strip().lower()
+if not expr:
+    print('uso: bmo-calc <expresión | 20% de X | 100 usd a cop>'); raise SystemExit(1)
+
+m = re.match(r'^([\d.,]+)\s*([a-z]{3})\s+(?:a|en|to)\s+([a-z]{3})$', expr)
+if m:
+    amt = float(m.group(1).replace(',', '.'))
+    src, dst = m.group(2).upper(), m.group(3).upper()
+    try:
+        with urllib.request.urlopen(f'https://open.er-api.com/v6/latest/{src}', timeout=12) as r:
+            rate = json.load(r)['rates'][dst]
+        print(f'{amt:g} {src} = {amt * rate:,.2f} {dst} (tasa: {rate:,.4f})')
+    except KeyError:
+        print(f'ERROR: moneda desconocida ({src} o {dst})'); raise SystemExit(1)
+    except Exception:
+        print('ERROR: servicio de tasas no disponible'); raise SystemExit(1)
+    raise SystemExit(0)
+
+m = re.match(r'^([\d.,]+)\s*%\s*(?:de|of)\s*([\d.,]+)$', expr)
+if m:
+    p = float(m.group(1).replace(',', '.'))
+    base = float(m.group(2).replace(',', '.'))
+    print(f'{p:g}% de {base:g} = {p * base / 100:g}')
+    raise SystemExit(0)
+
+expr = expr.replace('^', '**').replace('×', '*').replace('÷', '/')
+expr = re.sub(r'raiz de|raíz de', 'sqrt', expr)
+if not re.fullmatch(r"[\d\s+\-*/().,a-z_']*", expr):
+    print('ERROR: expresión no válida'); raise SystemExit(1)
+allowed = {k: getattr(math, k) for k in (
+    'sqrt', 'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'log', 'log10',
+    'log2', 'exp', 'floor', 'ceil', 'fabs', 'pow', 'radians', 'degrees',
+    'pi', 'e', 'tau')}
+allowed['abs'] = abs
+allowed['round'] = round
+try:
+    result = eval(expr.replace(',', '.'), {'__builtins__': {}}, allowed)
+    print(f'{expr} = {result:g}' if isinstance(result, float) else f'{expr} = {result}')
+except Exception:
+    print('ERROR: no pude evaluar la expresión'); raise SystemExit(1)
+EOF

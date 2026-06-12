@@ -2,6 +2,11 @@ fastapi
 uvicorn[standard]
 sounddevice
 numpy
-openwakeword
-# faster-whisper lives in .venv-audio — install there separately
-# system dep: sudo apt-get install portaudio19-dev libportaudio2
+scipy
+vosk          # wake-word / keyword spotting (Spanish model in models/vosk-es)
+piper-tts     # neural text-to-speech (Spanish voice in models/piper)
+# faster-whisper lives in the separate .venv-audio — install there separately
+# (see WHISPER_VENV_PYTHON in backend.py / setup.sh).
+#
+# System dependency (Arch / CachyOS):  sudo pacman -S --needed portaudio
+# (On Debian/Ubuntu this was: portaudio19-dev libportaudio2)

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# BMO helper: puertos serie para robótica (Arduino, ESP32, micro:bit…).
+#   bmo-serial   → lista dispositivos serie USB conectados con nombre y puerto
+set -u
+
+found=0
+for dev in /dev/ttyUSB* /dev/ttyACM*; do
+  [ -e "$dev" ] || continue
+  found=1
+  vendor=$(udevadm info -q property -n "$dev" 2>/dev/null | awk -F= '/^ID_VENDOR=/{print $2}')
+  model=$(udevadm info -q property -n "$dev" 2>/dev/null | awk -F= '/^ID_MODEL=/{print $2}')
+  serial=$(udevadm info -q property -n "$dev" 2>/dev/null | awk -F= '/^ID_SERIAL_SHORT=/{print $2}')
+  echo "- $dev → ${vendor:-?} ${model:-?}${serial:+ (serie $serial)}"
+done
+
+if [ "$found" = 0 ]; then
+  echo "No hay dispositivos serie USB conectados (ttyUSB/ttyACM)."
+  exit 0
+fi
+
+# Aviso de permisos: en Arch hay que estar en el grupo uucp para abrir el puerto.
+if ! id -nG | grep -qw uucp; then
+  echo "AVISO: tu usuario no está en el grupo 'uucp' — sin permiso para abrir puertos."
+  echo "       Arreglo: sudo usermod -aG uucp $USER (y reiniciar sesión)."
+fi

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# BMO helper: hora y fecha en español. Opcional otra ciudad: bmo-time tokio
+set -u
+python3 - "${*:-}" <<'EOF'
+import sys, datetime, zoneinfo
+
+city = sys.argv[1].strip().lower()
+DIAS = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
+MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio',
+         'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre']
+ALIAS = {
+    'tokio': 'Asia/Tokyo', 'japón': 'Asia/Tokyo', 'japon': 'Asia/Tokyo',
+    'nueva york': 'America/New_York', 'new york': 'America/New_York',
+    'miami': 'America/New_York', 'toronto': 'America/Toronto',
+    'madrid': 'Europe/Madrid', 'españa': 'Europe/Madrid', 'espana': 'Europe/Madrid',
+    'londres': 'Europe/London', 'parís': 'Europe/Paris', 'paris': 'Europe/Paris',
+    'berlín': 'Europe/Berlin', 'berlin': 'Europe/Berlin', 'roma': 'Europe/Rome',
+    'moscú': 'Europe/Moscow', 'moscu': 'Europe/Moscow',
+    'méxico': 'America/Mexico_City', 'mexico': 'America/Mexico_City',
+    'bogotá': 'America/Bogota', 'bogota': 'America/Bogota', 'lima': 'America/Lima',
+    'santiago': 'America/Santiago', 'caracas': 'America/Caracas',
+    'buenos aires': 'America/Argentina/Buenos_Aires',
+    'sao paulo': 'America/Sao_Paulo', 'brasil': 'America/Sao_Paulo',
+    'los ángeles': 'America/Los_Angeles', 'los angeles': 'America/Los_Angeles',
+    'san francisco': 'America/Los_Angeles',
+    'pekín': 'Asia/Shanghai', 'pekin': 'Asia/Shanghai', 'china': 'Asia/Shanghai',
+    'india': 'Asia/Kolkata', 'dubái': 'Asia/Dubai', 'dubai': 'Asia/Dubai',
+    'seúl': 'Asia/Seoul', 'seul': 'Asia/Seoul',
+    'sídney': 'Australia/Sydney', 'sidney': 'Australia/Sydney',
+}
+
+if city:
+    tzname = ALIAS.get(city)
+    if not tzname:
+        needle = city.replace(' ', '_')
+        tzname = next((tz for tz in sorted(zoneinfo.available_timezones())
+                       if needle in tz.lower()), None)
+    if not tzname:
+        print(f"No conozco la zona horaria de '{city}'"); raise SystemExit(1)
+    now = datetime.datetime.now(zoneinfo.ZoneInfo(tzname))
+    print(f"En {city.title()} son las {now:%H:%M} del {DIAS[now.weekday()]} "
+          f"{now.day} de {MESES[now.month - 1]}.")
+else:
+    now = datetime.datetime.now()
+    print(f"Hoy es {DIAS[now.weekday()]} {now.day} de {MESES[now.month - 1]} "
+          f"de {now.year} y son las {now:%H:%M}.")
+EOF

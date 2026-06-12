@@ -6,7 +6,8 @@ Audio pipeline
 ──────────────
 sounddevice (1280-sample / 80 ms blocks at 16 kHz)
   └─▶ raw_q  ──▶  pipeline_thread
-                    ├─ LISTENING  : feeds 80ms chunks to OpenWakeWord (correct window size)
+                    ├─ IDLE       : waits for a push-to-talk trigger (POST /trigger,
+                    │               fired by Alt+backslash via Hyprland bind or kiosk page)
                     ├─ RECORDING  : accumulates COMMAND_SECONDS of audio after trigger
                     └─ offloads Whisper + bot query to worker thread
                          └─▶ broadcast_q  ──▶  broadcaster (async)  ──▶  WebSocket clients
@@ -23,11 +24,11 @@ import asyncio
 import json
 import os
 import queue
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
-import unicodedata
 import uuid
 import wave
 from pathlib import Path
@@ -38,89 +39,124 @@ from scipy.signal import resample_poly
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from openwakeword.model import Model
+try:
+    from piper import PiperVoice
+except Exception:  # piper optional — app still runs (silent) without it
+    PiperVoice = None
 
 # ── paths ──────────────────────────────────────────────────────────────────────
+# All external-asset locations are env-overridable so the app is portable across
+# machines. Defaults preserve the original OpenClaw workspace layout.
 APP_DIR = Path(__file__).resolve().parent
-BMO_MODEL_DIR = Path('/home/eduarp/.openclaw/workspace/repos/BMO/openWakeWordModel')
-WHISPER_VENV_PYTHON = '/home/eduarp/.openclaw/workspace/.venv-audio/bin/python'
-WHISPER_MODEL_PATH = '/home/eduarp/.openclaw/workspace/models/whisper-small'
+OPENCLAW_HOME = Path(os.getenv('OPENCLAW_HOME', str(Path.home() / '.openclaw')))
+# Audio assets default to repo-local locations (set up by setup.sh) so the app is
+# self-contained; override with env vars to point elsewhere.
+WHISPER_VENV_PYTHON = os.getenv('WHISPER_VENV_PYTHON', str(APP_DIR / '.venv-audio/bin/python'))
+WHISPER_MODEL_PATH = os.getenv('WHISPER_MODEL_PATH', str(APP_DIR / 'models/whisper-small'))
 
 # ── OpenClaw integration ───────────────────────────────────────────────────────
 OPENCLAW_SESSION_KEY = os.getenv('OPENCLAW_SESSION_KEY', 'agent:main:main')
 OPENCLAW_TIMEOUT_MS = int(os.getenv('OPENCLAW_TIMEOUT_MS', '45000'))
-OPENCLAW_SESSIONS_INDEX = Path('/home/eduarp/.openclaw/agents/main/sessions/sessions.json')
+OPENCLAW_SESSIONS_INDEX = Path(os.getenv(
+    'OPENCLAW_SESSIONS_INDEX', str(OPENCLAW_HOME / 'agents/main/sessions/sessions.json')))
 
 # ── audio / model config ───────────────────────────────────────────────────────
 TARGET_SAMPLE_RATE = 16000
-# CRITICAL: OpenWakeWord was trained on 80ms (1280-sample) windows at 16kHz.
-# Passing larger chunks causes the model to evaluate only the LAST window and
-# miss detections earlier in the block. Always feed exactly 1280 samples.
-WAKEWORD_CHUNK = 1280
-CHUNK_SECONDS = WAKEWORD_CHUNK / TARGET_SAMPLE_RATE   # 0.08 s per chunk
-WAKEWORD_THRESHOLD = 0.5
-TRIGGER_COOLDOWN = 3.0   # min seconds between back-to-back triggers
+CHUNK_SAMPLES = 1280                                   # 80 ms blocks at 16 kHz
+CHUNK_SECONDS = CHUNK_SAMPLES / TARGET_SAMPLE_RATE     # 0.08 s per chunk
 
-# VAD: after wakeword triggers, match BMO repo energy endpointing more closely.
+# VAD: after the push-to-talk trigger, energy endpointing.
 MIN_COMMAND_SECONDS = 1.0
 MAX_COMMAND_SECONDS = 12.0
 SILENCE_HANG_SECONDS = 0.9
-SPEECH_START_RMS_THRESHOLD = 0.16
-SILENCE_RMS_THRESHOLD = 0.12
+# RMS thresholds (normalized 0-1). Env-tunable per mic — the AM8 reads lower than
+# the original defaults, so these are set conservatively low and can be overridden.
+SPEECH_START_RMS_THRESHOLD = float(os.getenv('SPEECH_START_RMS', '0.04'))
+SILENCE_RMS_THRESHOLD = float(os.getenv('SILENCE_RMS', '0.02'))
 ASSISTANT_IDLE_WINDOW_SECONDS = 2.0
 
-WAKEWORD_MODEL_ONNX = BMO_MODEL_DIR / 'hey_bee_moh.onnx'
-WAKEWORD_FEATURE_DIR = BMO_MODEL_DIR / 'resources'
-
-# Phrases that end conversation mode (normalized: lowercase, no diacritics).
-EXIT_PHRASES = (
-    'adios',
-    'hasta luego',
-    'chao',
-    'chau',
-    'dejemos hasta aqui',
-    'corta',
-)
+# ── text-to-speech (Piper) ───────────────────────────────────────────────────────
+TTS_ENABLED = os.getenv('TTS_ENABLED', '1').lower() not in ('0', 'false', 'no')
+PIPER_VOICE_ONNX = os.getenv('PIPER_VOICE_ONNX', str(APP_DIR / 'models/piper/es_MX-claude-high.onnx'))
 
 # ── queues & shared state ──────────────────────────────────────────────────────
 raw_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=200)
 broadcast_q: "queue.Queue[dict]" = queue.Queue(maxsize=50)
-# Worker thread signals pipeline which state to resume ('recording' or 'listening')
+# Worker thread signals pipeline which state to resume ('recording' or 'idle')
 next_state_q: "queue.Queue[str]" = queue.Queue(maxsize=4)
+# Push-to-talk: POST /trigger drops a token here; pipeline_thread toggles state.
+trigger_q: "queue.Queue[str]" = queue.Queue(maxsize=4)
 CLIENTS: set["WebSocket"] = set()
 
 app = FastAPI()
 app.mount('/static', StaticFiles(directory=str(APP_DIR)), name='static')
 
 
-# ── wakeword model ─────────────────────────────────────────────────────────────
-def _load_wakeword_model() -> tuple["Model", str]:
-    if not WAKEWORD_MODEL_ONNX.exists():
-        raise FileNotFoundError(f'Missing model: {WAKEWORD_MODEL_ONNX}')
-    melspec = WAKEWORD_FEATURE_DIR / 'melspectrogram.onnx'
-    embed = WAKEWORD_FEATURE_DIR / 'embedding_model.onnx'
-    if not melspec.exists() or not embed.exists():
-        raise FileNotFoundError('Missing feature models in BMO resources dir')
-    model = Model(
-        wakeword_model_paths=[str(WAKEWORD_MODEL_ONNX)],
-        melspec_onnx_model_path=str(melspec),
-        embedding_onnx_model_path=str(embed),
-    )
-    name = next(iter(model.models))
-    print(f'[MODEL] Loaded wakeword: {name}', flush=True)
-    return model, name
+# ── text-to-speech (Piper) ───────────────────────────────────────────────────────
+_AUDIO_PLAYER = next((p for p in ('pw-play', 'paplay', 'aplay') if shutil.which(p)), None)
 
 
-wakeword_model, wakeword_name = _load_wakeword_model()
+def _load_tts():
+    if not TTS_ENABLED or PiperVoice is None:
+        print('[TTS] disabled', flush=True)
+        return None
+    if not Path(PIPER_VOICE_ONNX).exists():
+        print(f'[TTS] voice not found: {PIPER_VOICE_ONNX} — TTS off', flush=True)
+        return None
+    try:
+        voice = PiperVoice.load(PIPER_VOICE_ONNX)
+        print(f'[TTS] Piper voice: {Path(PIPER_VOICE_ONNX).name} (player={_AUDIO_PLAYER})', flush=True)
+        return voice
+    except Exception as exc:
+        print(f'[TTS] load failed: {type(exc).__name__}: {exc}', flush=True)
+        return None
+
+
+tts_voice = _load_tts()
+
+
+def _speak(text: str) -> None:
+    """Synthesize text with Piper and play it through the default output sink."""
+    if not tts_voice or not _AUDIO_PLAYER or not text.strip():
+        return
+    wav_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            wav_path = f.name
+        with wave.open(wav_path, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            have_rate = False
+            for chunk in tts_voice.synthesize(text):
+                if not have_rate:
+                    wf.setframerate(chunk.sample_rate)
+                    have_rate = True
+                wf.writeframes(chunk.audio_int16_bytes)
+        if have_rate:
+            subprocess.run([_AUDIO_PLAYER, wav_path], capture_output=True, timeout=120)
+    except Exception as exc:
+        print(f'[TTS] speak failed: {type(exc).__name__}: {exc}', flush=True)
+    finally:
+        if wav_path:
+            Path(wav_path).unlink(missing_ok=True)
 
 
 # ── device selection ───────────────────────────────────────────────────────────
-def _find_usb_input() -> int | None:
-    """Return sounddevice index of first USB microphone, or None for default."""
-    for i, d in enumerate(sd.query_devices()):
-        if d['max_input_channels'] > 0 and 'USB' in d['name'].upper():
-            print(f'[AUDIO] Found USB mic: {d["name"]} (idx={i})', flush=True)
-            return i
+def _find_usb_input(retries: int = 10, delay: float = 3.0) -> int | None:
+    """Return sounddevice index of first USB microphone, or None for default.
+
+    The mic can be briefly absent right after a backend restart (the old process
+    is still releasing it), so re-scan a few times before giving up.
+    """
+    for attempt in range(1, retries + 1):
+        for i, d in enumerate(sd.query_devices()):
+            if d['max_input_channels'] > 0 and 'USB' in d['name'].upper():
+                print(f'[AUDIO] Found USB mic: {d["name"]} (idx={i})', flush=True)
+                return i
+        print(f'[AUDIO] USB mic not found (attempt {attempt}/{retries}) — rescanning in {delay}s', flush=True)
+        time.sleep(delay)
+        sd._terminate()
+        sd._initialize()
     print('[AUDIO] No USB mic found, using default device', flush=True)
     return None
 
@@ -136,40 +172,109 @@ def _write_wav(path: str, pcm: np.ndarray) -> None:
 
 WHISPER_TIMEOUT_SECONDS = 90
 
+# Long-lived worker script: loads the model ONCE, then transcribes wav paths
+# read from stdin (one per line), answering one JSON string per line.
+_WHISPER_WORKER_SRC = (
+    'import json, sys\n'
+    'from faster_whisper import WhisperModel\n'
+    f'm = WhisperModel({WHISPER_MODEL_PATH!r}, device="cpu", compute_type="int8")\n'
+    'print("READY", flush=True)\n'
+    'for line in sys.stdin:\n'
+    '    p = line.strip()\n'
+    '    if not p:\n'
+    '        continue\n'
+    '    try:\n'
+    '        segs, info = m.transcribe(p, language="es", vad_filter=True)\n'
+    '        text = " ".join(s.text.strip() for s in segs).strip()\n'
+    '    except Exception:\n'
+    '        text = ""\n'
+    '    print(json.dumps(text), flush=True)\n'
+)
+
+
+class _WhisperServer:
+    """Persistent faster-whisper subprocess — avoids ~3s model reload per query."""
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+
+    def _readline(self, timeout: float) -> str | None:
+        import select
+        assert self._proc and self._proc.stdout
+        ready, _, _ = select.select([self._proc.stdout], [], [], timeout)
+        if not ready:
+            return None
+        return self._proc.stdout.readline().strip()
+
+    def _ensure(self) -> bool:
+        if self._proc and self._proc.poll() is None:
+            return True
+        print('[WHISPER] starting persistent worker (loading model)…', flush=True)
+        t0 = time.monotonic()
+        self._proc = subprocess.Popen(
+            [WHISPER_VENV_PYTHON, '-c', _WHISPER_WORKER_SRC],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        line = self._readline(WHISPER_TIMEOUT_SECONDS)
+        if line != 'READY':
+            print('[WHISPER] worker failed to start', flush=True)
+            self._kill()
+            return False
+        print(f'[WHISPER] worker ready in {time.monotonic() - t0:.1f}s', flush=True)
+        return True
+
+    def _kill(self) -> None:
+        if self._proc:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        self._proc = None
+
+    def warm_up(self) -> None:
+        with self._lock:
+            self._ensure()
+
+    def transcribe(self, wav_path: str) -> str:
+        with self._lock:
+            if not self._ensure():
+                return ''
+            try:
+                assert self._proc and self._proc.stdin
+                self._proc.stdin.write(wav_path + '\n')
+                self._proc.stdin.flush()
+                line = self._readline(WHISPER_TIMEOUT_SECONDS)
+                if line is None:
+                    print(f'[WHISPER] timed out after {WHISPER_TIMEOUT_SECONDS}s — restarting worker', flush=True)
+                    self._kill()
+                    return ''
+                return json.loads(line)
+            except Exception as exc:
+                print(f'[WHISPER] worker error: {type(exc).__name__}: {exc}', flush=True)
+                self._kill()
+                return ''
+
+
+_whisper_server = _WhisperServer()
+
 
 def _transcribe(pcm: np.ndarray) -> str:
-    """Run faster-whisper on PCM audio. No language forced — auto-detects."""
+    """Run faster-whisper on PCM audio via the persistent worker."""
     audio_seconds = len(pcm) / TARGET_SAMPLE_RATE
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
         wav_path = f.name
     try:
         _write_wav(wav_path, pcm)
-        cmd = [
-            WHISPER_VENV_PYTHON, '-c',
-            (
-                'from faster_whisper import WhisperModel; '
-                f'm = WhisperModel("{WHISPER_MODEL_PATH}", device="cpu", compute_type="int8"); '
-                f'segs, info = m.transcribe("{wav_path}"); '
-                'text = " ".join(s.text.strip() for s in segs).strip(); '
-                'import sys; print(f"LANG={{info.language}} PROB={{info.language_probability:.2f}}", file=sys.stderr); '
-                'print(text)'
-            ),
-        ]
-        print(f'[WHISPER] transcribing {audio_seconds:.2f}s audio (timeout {WHISPER_TIMEOUT_SECONDS}s)…', flush=True)
+        print(f'[WHISPER] transcribing {audio_seconds:.2f}s audio…', flush=True)
         t0 = time.monotonic()
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=WHISPER_TIMEOUT_SECONDS)
-        dt = time.monotonic() - t0
-        if r.returncode != 0:
-            print(f'[WHISPER] err {r.returncode} ({dt:.1f}s): {r.stderr.strip()[:300]}', flush=True)
-            return ''
-        if r.stderr.strip():
-            print(f'[WHISPER] {r.stderr.strip()} ({dt:.1f}s)', flush=True)
-        else:
-            print(f'[WHISPER] done in {dt:.1f}s', flush=True)
-        return r.stdout.strip()
-    except subprocess.TimeoutExpired:
-        print(f'[WHISPER] timed out after {WHISPER_TIMEOUT_SECONDS}s', flush=True)
-        return ''
+        text = _whisper_server.transcribe(wav_path)
+        print(f'[WHISPER] done in {time.monotonic() - t0:.1f}s', flush=True)
+        return text
     finally:
         Path(wav_path).unlink(missing_ok=True)
 
@@ -189,8 +294,12 @@ def _extract_text(node) -> str:
 
 
 def _run_gateway_call(method: str, params: dict, timeout_ms: int) -> subprocess.CompletedProcess:
+    # `bash -lc` runs a login shell so PATH already includes the mise-managed
+    # `openclaw` on this machine — no nvm needed. Override OPENCLAW_ENV_SETUP to
+    # prepend extra setup if a different node manager is required (e.g. 'nvm use 22 && ').
+    setup = os.getenv('OPENCLAW_ENV_SETUP', '')
     cmd = (
-        'source ~/.nvm/nvm.sh && nvm use 22 >/dev/null && '
+        f'{setup}'
         f'openclaw gateway call {method} --json --timeout {timeout_ms} '
         f'--params {json.dumps(json.dumps(params))}'
     )
@@ -304,55 +413,37 @@ def _push(payload: dict) -> None:
         broadcast_q.put_nowait(payload)
 
 
-# ── exit phrase detection ──────────────────────────────────────────────────────
-def _normalize(text: str) -> str:
-    stripped = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode()
-    return stripped.lower().strip().rstrip('.,!?¡¿')
-
-
-def _is_exit_phrase(text: str) -> bool:
-    norm = _normalize(text)
-    if not norm:
-        return False
-    return any(phrase in norm for phrase in EXIT_PHRASES)
-
-
 # ── worker: transcribe → bot query → broadcast ─────────────────────────────────
 def _respond_worker(audio: np.ndarray, device_name: str) -> None:
+    """Single-shot: transcribe → answer → speak → back to idle (no turn loop)."""
     try:
-        print('[CONVERSATION] worker started', flush=True)
+        print('[WORKER] started', flush=True)
         text = _transcribe(audio)
         print(f'[WHISPER] transcription -> {text!r}', flush=True)
 
         if not text:
-            print('[CONVERSATION] empty transcription, staying in conversation mode', flush=True)
-            next_state_q.put('recording')
+            print('[WORKER] empty transcription — back to idle', flush=True)
+            next_state_q.put('idle')
             return
 
         print('[OPENCLAW] sending transcript to chat backend', flush=True)
         _push({'type': 'user_message', 'text': text})
 
-        if _is_exit_phrase(text):
-            print('[CONVERSATION] exit phrase detected — leaving conversation mode', flush=True)
-            _push({'type': 'bot_message', 'text': 'Hasta luego.'})
-            _push({'type': 'state', 'state': 'listening', 'device': device_name})
-            next_state_q.put('listening')
-            return
-
         replies = _query_openclaw(text)
         print(f'[OPENCLAW] replies -> {replies!r}', flush=True)
         if replies:
+            _push({'type': 'state', 'state': 'speaking'})
             for reply in replies:
                 _push({'type': 'bot_message', 'text': reply})
+                _speak(reply)
         else:
             print('[OPENCLAW] empty reply or endpoint unavailable', flush=True)
 
-        print('[CONVERSATION] returning to recording mode for next turn', flush=True)
-        next_state_q.put('recording')
+        next_state_q.put('idle')
     except Exception as exc:
         print(f'[ERROR][WORKER] {type(exc).__name__}: {exc}', flush=True)
         _push({'type': 'bot_message', 'text': f'Error: {type(exc).__name__}'})
-        next_state_q.put('recording')
+        next_state_q.put('idle')
 
 
 # ── main audio/pipeline thread ─────────────────────────────────────────────────
@@ -362,9 +453,8 @@ def pipeline_thread() -> None:
         device_info = sd.query_devices(device_idx) if device_idx is not None else sd.query_devices(sd.default.device[0])
         device_name = device_info['name']
         input_sample_rate = int(device_info.get('default_samplerate') or 44100)
-        input_blocksize = int(round(WAKEWORD_CHUNK * input_sample_rate / TARGET_SAMPLE_RATE))
+        input_blocksize = int(round(CHUNK_SAMPLES * input_sample_rate / TARGET_SAMPLE_RATE))
 
-        last_trigger = 0.0
         resample_buf = np.array([], dtype=np.int16)
 
         def _sd_callback(indata, frames, time_info, status):
@@ -374,15 +464,15 @@ def pipeline_thread() -> None:
             mono = indata[:, 0].copy()
             resample_buf = np.concatenate([resample_buf, mono])
             resampled = resample_poly(resample_buf.astype(np.float32), TARGET_SAMPLE_RATE, input_sample_rate)
-            ready_samples = (len(resampled) // WAKEWORD_CHUNK) * WAKEWORD_CHUNK
+            ready_samples = (len(resampled) // CHUNK_SAMPLES) * CHUNK_SAMPLES
             if ready_samples == 0:
                 return
             ready = np.clip(resampled[:ready_samples], -32768, 32767).astype(np.int16)
             consumed_input = int(round(ready_samples * input_sample_rate / TARGET_SAMPLE_RATE))
             resample_buf = resample_buf[consumed_input:]
-            for start in range(0, len(ready), WAKEWORD_CHUNK):
+            for start in range(0, len(ready), CHUNK_SAMPLES):
                 try:
-                    raw_q.put_nowait(ready[start:start + WAKEWORD_CHUNK])
+                    raw_q.put_nowait(ready[start:start + CHUNK_SAMPLES])
                 except queue.Full:
                     pass
 
@@ -394,10 +484,11 @@ def pipeline_thread() -> None:
             blocksize=input_blocksize,
             callback=_sd_callback,
         ):
-            _push({'type': 'state', 'state': 'listening', 'device': device_name})
+            _push({'type': 'state', 'state': 'idle', 'device': device_name})
             print(f'[AUDIO] Stream open on "{device_name}" at {input_sample_rate} Hz, resampling to {TARGET_SAMPLE_RATE} Hz', flush=True)
+            print('[TRIGGER] push-to-talk ready — POST /trigger (Alt+\\) toggles listening', flush=True)
 
-            state = 'listening'
+            state = 'idle'
             command_buf: list[np.ndarray] = []
             speech_started = False
             silence_chunks = 0
@@ -406,39 +497,49 @@ def pipeline_thread() -> None:
                 try:
                     chunk = raw_q.get(timeout=1.0)
                 except queue.Empty:
+                    chunk = None   # no audio — still service the trigger below
+
+                # Push-to-talk toggle from POST /trigger. Processed even when the
+                # audio stream is silent so the hotkey never queues up unanswered.
+                triggered = False
+                try:
+                    trigger_q.get_nowait()
+                    triggered = True
+                except queue.Empty:
+                    pass
+
+                if chunk is None:
+                    if triggered and state == 'idle':
+                        print('[TRIGGER] hotkey (sin audio del mic todavía) — modo conversación', flush=True)
+                        state = 'recording'
+                        command_buf = []
+                        speech_started = False
+                        silence_chunks = 0
+                        _push({'type': 'state', 'state': 'recording'})
+                    elif triggered and state == 'recording':
+                        print('[TRIGGER] hotkey — cancelando, vuelta a idle', flush=True)
+                        state = 'idle'
+                        _push({'type': 'state', 'state': 'idle', 'device': device_name})
                     continue
 
                 rms = float(np.sqrt(np.mean(np.square(chunk.astype(np.float32) / 32768.0))))
 
                 if state == 'thinking':
+                    # Trigger is ignored while a response is in flight.
                     try:
-                        nxt = next_state_q.get_nowait()
+                        next_state_q.get_nowait()
                     except queue.Empty:
                         _push({'type': 'audio_level', 'level': round(rms, 4), 'score': 0.0})
                         continue
-                    print(f'[CONVERSATION] next state from worker -> {nxt}', flush=True)
-                    if nxt == 'recording':
-                        print('[CONVERSATION] continuing — next turn', flush=True)
-                        command_buf = []
-                        speech_started = False
-                        silence_chunks = 0
-                        state = 'recording'
-                        _push({'type': 'state', 'state': 'recording'})
-                    else:
-                        state = 'listening'
-                        _push({'type': 'state', 'state': 'listening', 'device': device_name})
+                    print('[WORKER] done — back to idle', flush=True)
+                    state = 'idle'
+                    _push({'type': 'state', 'state': 'idle', 'device': device_name})
                     continue
 
-                if state == 'listening':
-                    pred = wakeword_model.predict(chunk)
-                    score = float(pred.get(wakeword_name, next(iter(pred.values()), 0.0)))
-                    _push({'type': 'audio_level', 'level': round(rms, 4), 'score': round(score, 4)})
-                    print(f'[WW] score={score:.4f} rms={rms:.4f}', flush=True)
-
-                    now = time.monotonic()
-                    if score >= WAKEWORD_THRESHOLD and (now - last_trigger) >= TRIGGER_COOLDOWN:
-                        last_trigger = now
-                        print(f'[WAKEWORD] Triggered! score={score:.4f} — entrando a modo conversación', flush=True)
+                if state == 'idle':
+                    _push({'type': 'audio_level', 'level': round(rms, 4), 'score': 0.0})
+                    if triggered:
+                        print('[TRIGGER] hotkey — entrando a modo conversación', flush=True)
                         state = 'recording'
                         command_buf = []
                         speech_started = False
@@ -446,6 +547,15 @@ def pipeline_thread() -> None:
                         _push({'type': 'state', 'state': 'recording'})
 
                 elif state == 'recording':
+                    if triggered:
+                        # Second press cancels the conversation and returns to idle.
+                        print('[TRIGGER] hotkey — cancelando, vuelta a idle', flush=True)
+                        command_buf = []
+                        speech_started = False
+                        silence_chunks = 0
+                        state = 'idle'
+                        _push({'type': 'state', 'state': 'idle', 'device': device_name})
+                        continue
                     _push({'type': 'audio_level', 'level': round(rms, 4), 'score': 0.0})
 
                     if not speech_started:
@@ -454,6 +564,9 @@ def pipeline_thread() -> None:
                             command_buf = [chunk]
                             silence_chunks = 0
                             print(f'[REC] speech started rms={rms:.4f}', flush=True)
+                        elif rms > 0.008:
+                            # Calibration: sound present but below start threshold.
+                            print(f'[REC] waiting — rms={rms:.4f} < start {SPEECH_START_RMS_THRESHOLD}', flush=True)
                         continue
 
                     command_buf.append(chunk)
@@ -506,10 +619,34 @@ def favicon():
 
 @app.post('/bot_message')
 async def bot_message_push(body: dict):
-    """OpenClaw or any external service can POST here to push a bubble."""
+    """OpenClaw or any external service can POST here to push a bubble.
+
+    Also speaks the text aloud (used by bmo-reminder and other tools so BMO
+    announces reminders Alexa-style).
+    """
     text = (body.get('text') or '').strip()
     if text:
         _push({'type': 'bot_message', 'text': text})
+        _push({'type': 'state', 'state': 'speaking'})
+
+        def _say() -> None:
+            _speak(text)
+            _push({'type': 'state', 'state': 'idle'})
+
+        threading.Thread(target=_say, daemon=True).start()
+    return JSONResponse({'ok': True})
+
+
+@app.post('/trigger')
+async def trigger():
+    """Push-to-talk toggle: idle → recording, recording → idle (cancel).
+
+    Fired by the global Alt+\\ Hyprland bind (curl) or a keypress in the kiosk page.
+    """
+    try:
+        trigger_q.put_nowait('toggle')
+    except queue.Full:
+        pass
     return JSONResponse({'ok': True})
 
 
@@ -518,7 +655,7 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     CLIENTS.add(ws)
     try:
-        await ws.send_text(json.dumps({'type': 'state', 'state': 'listening'}))
+        await ws.send_text(json.dumps({'type': 'state', 'state': 'idle'}))
         while True:
             await asyncio.sleep(30)
     except WebSocketDisconnect:
@@ -546,4 +683,6 @@ async def broadcaster():
 @app.on_event('startup')
 async def startup():
     threading.Thread(target=pipeline_thread, daemon=True).start()
+    # Pre-load the whisper model so the first voice query doesn't pay for it.
+    threading.Thread(target=_whisper_server.warm_up, daemon=True).start()
     asyncio.create_task(broadcaster())

@@ -1,3 +1,5 @@
-path/to/venv/
+.venv/
+.venv-audio/
+models/
 __pycache__/
 *.pyc

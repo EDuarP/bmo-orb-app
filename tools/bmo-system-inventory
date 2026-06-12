@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# BMO helper: inventario/estado del sistema en español, conciso para voz.
+#   bmo-system-inventory          → resumen general
+#   bmo-system-inventory disco    → solo almacenamiento
+#   bmo-system-inventory procesos → top 5 procesos por CPU/RAM
+set -u
+
+resumen() {
+  local os kernel cpu ram_total ram_usada gpu disco uptime
+  os=$(grep -oP '(?<=^PRETTY_NAME=").*(?=")' /etc/os-release 2>/dev/null || echo "Linux")
+  kernel=$(uname -r)
+  cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //;s/ \+/ /g')
+  read -r ram_total ram_usada <<<"$(free -h --si | awk '/^Mem/{print $2, $3}')"
+  gpu=$(command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null | head -1 || lspci 2>/dev/null | grep -i 'vga\|3d' | head -1 | cut -d: -f3 | sed 's/^ //')
+  disco=$(df -h / | awk 'NR==2{printf "%s usados de %s (%s)", $3, $2, $5}')
+  uptime=$(uptime -p | sed 's/^up /encendido hace /;s/hours\?/horas/;s/minutes\?/minutos/;s/days\?/días/')
+  echo "Sistema: $os (kernel $kernel)"
+  echo "CPU: $cpu"
+  echo "RAM: $ram_usada en uso de $ram_total"
+  echo "GPU: $gpu"
+  echo "Disco raíz: $disco"
+  echo "Uptime: $uptime"
+}
+
+disco() {
+  df -h --output=target,size,used,avail,pcent -x tmpfs -x devtmpfs -x efivarfs 2>/dev/null | head -8
+}
+
+procesos() {
+  echo "Top 5 por CPU:"
+  ps -eo comm,%cpu,%mem --sort=-%cpu | head -6 | tail -5
+  echo "Top 5 por RAM:"
+  ps -eo comm,%mem,%cpu --sort=-%mem | head -6 | tail -5
+}
+
+case "${1:-resumen}" in
+  disco|disk|almacenamiento) disco ;;
+  procesos|proc|top) procesos ;;
+  *) resumen ;;
+esac

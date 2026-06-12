@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# BMO helper: control de Spotify por voz (cliente oficial + MPRIS, sin API keys).
+#   bmo-spotify play <canción/artista>  → busca la canción y la reproduce
+#   bmo-spotify pause|resume|next|prev|status
+# Resolución nombre→URI por capas (todas sin credenciales):
+#   caché local → búsqueda web del gateway OpenClaw → DDG lite → spotify:search
+# El control de reproducción es 100% local vía playerctl/D-Bus.
+set -u
+
+UA="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+OPENCLAW_BIN="${OPENCLAW_BIN:-$HOME/.local/share/mise/shims/openclaw}"
+CACHE="$HOME/.cache/bmo-spotify-cache.tsv"
+
+now_playing() {
+  playerctl -p spotify metadata --format '{{title}} — {{artist}}' 2>/dev/null
+}
+
+ensure_spotify() {
+  playerctl -p spotify status >/dev/null 2>&1 && return 0
+  setsid -f spotify >/dev/null 2>&1
+  for _ in $(seq 1 40); do
+    if playerctl -p spotify status >/dev/null 2>&1; then sleep 1; return 0; fi
+    sleep 0.5
+  done
+  echo "ERROR: Spotify no arrancó (sin MPRIS tras 20s)" >&2
+  return 1
+}
+
+extract_id() {
+  grep -oE 'open\.spotify\.com(%2F|/)track(%2F|/)[A-Za-z0-9]{22}' \
+    | head -1 | grep -oE '[A-Za-z0-9]{22}$'
+}
+
+resolve_track() { # $1 = consulta → spotify:track:ID por stdout
+  local key q id
+  key=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -s ' ')
+  # 1) caché de resoluciones previas
+  if [ -f "$CACHE" ]; then
+    id=$(awk -F'\t' -v k="$key" '$1==k{print $2; exit}' "$CACHE")
+    [ -n "$id" ] && { echo "$id"; return 0; }
+  fi
+  q=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote_plus(sys.argv[1]))" "$1")
+  # 2) Brave search (scrape simple, rápido)
+  id=$(curl -s -m 12 -A "$UA" "https://search.brave.com/search?q=${q}+site%3Aopen.spotify.com%2Ftrack" | extract_id)
+  # 3) búsqueda web del gateway de OpenClaw (ojo: imprime por stderr → 2>&1)
+  if [ -z "$id" ]; then
+    id=$("$OPENCLAW_BIN" infer web search --query "$1 site:open.spotify.com/track" 2>&1 | extract_id)
+  fi
+  # 4) DDG lite directo
+  if [ -z "$id" ]; then
+    id=$(curl -s -m 12 -A "$UA" "https://lite.duckduckgo.com/lite/?q=${q}+site%3Aopen.spotify.com%2Ftrack" | extract_id)
+  fi
+  [ -n "$id" ] || return 1
+  mkdir -p "$(dirname "$CACHE")"
+  printf '%s\t%s\n' "$key" "spotify:track:$id" >>"$CACHE"
+  echo "spotify:track:$id"
+}
+
+case "${1:-}" in
+  play)
+    shift
+    q="$*"
+    if [ -z "$q" ]; then
+      # "play" sin argumentos = reanudar
+      ensure_spotify || exit 1
+      playerctl -p spotify play && echo "Reanudado: $(now_playing)"
+      exit 0
+    fi
+    if uri=$(resolve_track "$q"); then
+      ensure_spotify || exit 1
+      playerctl -p spotify open "$uri" || { echo "ERROR: Spotify no aceptó $uri"; exit 1; }
+      sleep 1.5
+      playerctl -p spotify play 2>/dev/null
+      echo "Reproduciendo: $(now_playing)"
+    else
+      # Último recurso honesto: abre la búsqueda en la app para elegir a mano.
+      ensure_spotify || exit 1
+      qenc=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$q")
+      setsid -f spotify --uri "spotify:search:$qenc" >/dev/null 2>&1
+      echo "AVISO: no pude resolver '$q' a una canción exacta; dejé la búsqueda abierta en Spotify"
+      exit 2
+    fi
+    ;;
+  pause)  playerctl -p spotify pause  && echo "Pausado" ;;
+  resume) playerctl -p spotify play   && echo "Reanudado: $(now_playing)" ;;
+  next)   playerctl -p spotify next   && sleep 1 && echo "Siguiente: $(now_playing)" ;;
+  prev)   playerctl -p spotify previous && sleep 1 && echo "Anterior: $(now_playing)" ;;
+  status)
+    st=$(playerctl -p spotify status 2>/dev/null) || { echo "Spotify no está corriendo"; exit 0; }
+    echo "$st: $(now_playing)"
+    ;;
+  *)
+    echo "uso: bmo-spotify {play <canción>|pause|resume|next|prev|status}"
+    exit 1
+    ;;
+esac

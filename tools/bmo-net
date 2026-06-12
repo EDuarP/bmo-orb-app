@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# BMO helper: red e IoT.
+#   bmo-net               → resumen: IP local/pública, gateway, estado de internet
+#   bmo-net dispositivos  → equipos vistos en la LAN (ESP32, raspberry, etc.)
+#   bmo-net puertos       → puertos escuchando en esta máquina (servidores de dev)
+set -u
+
+case "${1:-resumen}" in
+  dispositivos|devices|lan)
+    # Sin nmap: tabla de vecinos del kernel (ARP). Cubre lo que ha hablado en la LAN.
+    echo "Dispositivos vistos en la LAN (tabla ARP):"
+    found=0
+    while read -r ip _ _ _ mac state; do
+      [ -n "$ip" ] || continue
+      case "$state" in FAILED|INCOMPLETE) continue ;; esac
+      name=$(getent hosts "$ip" 2>/dev/null | awk '{print $2}')
+      found=1
+      printf -- "- %s  %s  %s %s\n" "$ip" "${mac:-?}" "${name:-}" "($state)"
+    done < <(ip neigh show | grep -v '^fe80')
+    [ "$found" = 1 ] || echo "(ninguno — prueba hacer ping a la IP del dispositivo primero)"
+    ;;
+  puertos|ports)
+    echo "Puertos TCP escuchando en esta máquina:"
+    ss -tlnp 2>/dev/null | awk 'NR>1 {split($4,a,":"); port=a[length(a)];
+      match($0, /users:\(\("([^"]+)/, p);
+      printf "- puerto %s → %s\n", port, (p[1] ? p[1] : "?")}' | sort -t' ' -k3 -u
+    ;;
+  *)
+    iface=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+    gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+    ipl=$(ip -4 addr show "${iface:-}" 2>/dev/null | awk '/inet /{print $2; exit}')
+    echo "Equipo: $(hostnamectl hostname 2>/dev/null || hostname)"
+    echo "Interfaz: ${iface:-?} — IP local: ${ipl:-?} — Gateway: ${gw:-?}"
+    if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then
+      echo "Internet: conectado (ping $(ping -c1 -W2 1.1.1.1 | grep -oE 'time=[0-9.]+ ms' | cut -d= -f2))"
+      echo "IP pública: $(curl -s -m 6 https://ifconfig.me || echo '?')"
+    else
+      echo "Internet: SIN conexión"
+    fi
+    ;;
+esac
