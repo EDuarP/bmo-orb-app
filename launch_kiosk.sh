@@ -5,6 +5,9 @@ set -e
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$APP_DIR"
 
+# mise instala `openclaw` como shim; un bash no-login no lo trae en PATH.
+export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
+
 # Optional startup delay — useful when launched from Hyprland autostart so the
 # desktop / OpenClaw gateway can come up first. Manual runs: leave at 0.
 sleep "${BMO_STARTUP_DELAY:-0}"
@@ -18,6 +21,21 @@ if ! systemctl --user is-active --quiet openclaw-gateway.service; then
   echo "[BMO] starting openclaw-gateway.service…"
   systemctl --user start openclaw-gateway.service || true
 fi
+
+# ── Conversación nueva en cada arranque ─────────────────────────────────────────
+# BMO usa una sesión DEDICADA (aislada del 'main' de Telegram) y la RESETEA en cada
+# lanzamiento: cada vez que inicias BMO empiezas una charla en blanco, sin arrastrar
+# historia vieja (ni un estado corrupto como el bucle de auto-reenvío). El retry
+# también sirve de espera a que el gateway termine de levantar.
+export OPENCLAW_SESSION_KEY="${OPENCLAW_SESSION_KEY:-agent:main:voice}"
+echo "[BMO] esperando gateway y reseteando sesión $OPENCLAW_SESSION_KEY…"
+for _ in $(seq 1 30); do
+  if openclaw gateway call sessions.reset --params "{\"key\":\"$OPENCLAW_SESSION_KEY\"}" >/dev/null 2>&1; then
+    echo "[BMO] sesión reseteada — conversación nueva"
+    break
+  fi
+  sleep 0.5
+done
 
 # Ollama runs manually on this machine (not the system service — models in ~/.ollama).
 if ! curl -sf http://127.0.0.1:11434/ >/dev/null 2>&1; then

@@ -12,6 +12,30 @@ WebSocket → orb UI (blob amorfo de partículas blancas, Chromium kiosk)
 No hay wakeword: se activa con **Alt+\\** (toggle — segunda pulsación cancela).
 Single-shot: una consulta → una respuesta → vuelta a idle (sin turnos).
 
+## Modelo del LLM — recomendación
+
+El orbe es un **agente que ejecuta** (abre apps, reproduce música, lee la pantalla,
+corre los scripts `tools/` vía `exec`): la fiabilidad en *tool-calling* importa más
+que la calidad de chat.
+
+> ⚠️ **Un modelo local de 8B se queda corto.** En esta máquina `llama3.1:8b` (a) caía
+> en bucles al usar la herramienta de mensajería entre sesiones (`sessions_send`)
+> hablándose a sí mismo hasta desbordar el contexto, y (b) con su ventana corta fallaba
+> la auto-compactación y la sesión quedaba clavada. Los modelos pequeños además tienden
+> a *describir* el comando en vez de ejecutarlo (`gemma` es especialmente flojo en
+> tool-calling — no usarlo aquí).
+
+**Recomendado: un modelo cloud vía Ollama.** Tras `ollama signin` (Ollama Cloud),
+apunta el proveedor de OpenClaw a un modelo grande — p.ej. **`gpt-oss:120b-cloud`**.
+Enruta por el Ollama local (`127.0.0.1:11434`), ejecuta herramientas de forma fiable y
+su contexto de 128k elimina los fallos de compactación. Nota: el *free tier* tiene
+cuota por tiempo de GPU (reinicia ~cada 5 h / semanal); conviene dejar un modelo local
+(`llama3.1:8b`) como respaldo.
+
+Defensa en profundidad recomendada en `openclaw.json`:
+`tools.loopDetection.enabled: true` — corta cualquier bucle de llamadas repetidas sin
+bloquear herramientas.
+
 ## Herramientas de voz (`tools/`)
 
 Scripts deterministas que cubren las debilidades del LLM local (8B): el agente
@@ -56,9 +80,12 @@ wheels yet) via `mise`, and installs `portaudio` with pacman.
 ## What you must provide
 
 1. **OpenClaw** — the LLM backend. The orb calls `openclaw gateway call
-   chat.send` against the session key `agent:main:main` and reads replies from
-   the OpenClaw session file. OpenClaw must be configured, with its model
-   provider pointed at local Ollama (modelo primario: `llama3.1:8b`).
+   chat.send` against una sesión **dedicada** (`agent:main:voice`, aislada del
+   `main` de Telegram) y lee las respuestas del archivo de sesión de OpenClaw.
+   `launch_kiosk.sh` **resetea esa sesión en cada arranque** → cada vez que inicias
+   `bmo` empiezas una conversación nueva. OpenClaw debe estar configurado con su
+   proveedor de modelo apuntando a Ollama; ver **Modelo del LLM** arriba (recomendado
+   un cloud como `gpt-oss:120b-cloud`, no un 8B local).
 2. **Hyprland bind global** (ya configurado en `~/.config/hypr/bindings.lua`):
    ```lua
    o.bind("ALT + BACKSLASH", "BMO escuchar", "curl -s -X POST http://127.0.0.1:8765/trigger")
@@ -73,7 +100,7 @@ All paths default to repo-local locations; override as needed:
 | `BMO_PORT` | `8765` | backend / UI port |
 | `WHISPER_MODEL_PATH` | `./models/whisper-small` | faster-whisper model |
 | `WHISPER_VENV_PYTHON` | `./.venv-audio/bin/python` | isolated whisper interpreter |
-| `OPENCLAW_SESSION_KEY` | `agent:main:main` | OpenClaw session |
+| `OPENCLAW_SESSION_KEY` | `agent:main:voice` | OpenClaw session dedicada (el launcher la resetea en cada arranque) |
 | `OPENCLAW_HOME` | `~/.openclaw` | OpenClaw home (sessions index) |
 | `PIPER_VOICE_ONNX` | `./models/piper/es_MX-claude-high.onnx` | voz TTS |
 | `TTS_ENABLED` | `1` | poner `0` para silenciar |

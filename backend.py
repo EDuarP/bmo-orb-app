@@ -60,6 +60,42 @@ OPENCLAW_TIMEOUT_MS = int(os.getenv('OPENCLAW_TIMEOUT_MS', '45000'))
 OPENCLAW_SESSIONS_INDEX = Path(os.getenv(
     'OPENCLAW_SESSIONS_INDEX', str(OPENCLAW_HOME / 'agents/main/sessions/sessions.json')))
 
+# Robustez: textos que BMO NO debe decir en voz alta. Son ecos del envoltorio de
+# mensajería interna de OpenClaw que un modelo pequeño a veces parrotea (fue la
+# causa del bucle "Sender (untrusted metadata)/contenido inter-sesión"). Si una
+# respuesta es solo este ruido, se descarta.
+_NOISE_MARKERS = (
+    'contenido inter-sesión',
+    'contenido inter-sesion',
+    '[inter-session message]',
+    'inter-session data',
+    'untrusted metadata',
+    'sourcetool=sessions',
+    'sourcesession=',
+    'el sender (no confiable)',
+    'el sender no confiable',
+    'sender (untrusted metadata)',
+)
+# Señales de sesión "clavada" (overflow / compactación fallida). No se dicen: en su
+# lugar el backend resetea la sesión y reintenta una vez.
+_WEDGED_MARKERS = (
+    'auto-compaction could not recover',
+    'context overflow',
+    'already compacted',
+    'prompt too large for the model',
+    'start a fresh session',
+)
+
+
+def _is_noise_reply(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _NOISE_MARKERS)
+
+
+def _is_wedged_reply(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _WEDGED_MARKERS)
+
 # ── audio / model config ───────────────────────────────────────────────────────
 TARGET_SAMPLE_RATE = 16000
 CHUNK_SAMPLES = 1280                                   # 80 ms blocks at 16 kHz
@@ -343,7 +379,8 @@ def _read_new_assistant_replies(session_file: Path | None, start_offset: int) ->
                     continue
                 content = _extract_text(msg.get('content', ''))
                 cleaned = content.replace('[[reply_to_current]]', '').strip() if content else ''
-                if cleaned:
+                # Nunca pronunciar los ecos del envoltorio de mensajería interna.
+                if cleaned and not _is_noise_reply(cleaned):
                     replies.append(cleaned)
             new_offset = fh.tell()
         return replies, new_offset
@@ -352,7 +389,19 @@ def _read_new_assistant_replies(session_file: Path | None, start_offset: int) ->
         return [], start_offset
 
 
-def _query_openclaw(text: str) -> list[str]:
+def _reset_session() -> bool:
+    """Reset BMO's OpenClaw session to recover from a wedged/overflowed state."""
+    try:
+        res = _run_gateway_call('sessions.reset', {'key': OPENCLAW_SESSION_KEY}, 15000)
+        ok = res.returncode == 0
+        print(f'[OPENCLAW] session reset ({"ok" if ok else "failed"})', flush=True)
+        return ok
+    except Exception as exc:
+        print(f'[OPENCLAW] session reset error: {exc}', flush=True)
+        return False
+
+
+def _query_openclaw(text: str, _attempt: int = 1) -> list[str]:
     if not OPENCLAW_SESSION_KEY:
         return []
 
@@ -379,6 +428,15 @@ def _query_openclaw(text: str) -> list[str]:
         if stdout:
             print(f'[OPENCLAW] chat.send -> {stdout}', flush=True)
 
+        # Sesión nueva (key dedicada recién reseteada): el archivo aún no existía
+        # cuando calculamos session_file. Re-resolverlo tras el envío.
+        if session_file is None:
+            for _ in range(6):
+                session_file = _session_file_for_key(OPENCLAW_SESSION_KEY)
+                if session_file and session_file.exists():
+                    break
+                time.sleep(0.5)
+
         deadline = time.monotonic() + max(15, OPENCLAW_TIMEOUT_MS / 1000)
         replies: list[str] = []
         last_reply_at: float | None = None
@@ -388,9 +446,20 @@ def _query_openclaw(text: str) -> list[str]:
                 replies.extend(new_replies)
                 last_reply_at = time.monotonic()
             if replies and last_reply_at and (time.monotonic() - last_reply_at) >= ASSISTANT_IDLE_WINDOW_SECONDS:
-                return replies
+                break
             time.sleep(0.5)
 
+        # ¿Sesión clavada (overflow / compactación fallida)? Resetear y reintentar
+        # UNA vez con una conversación limpia, en vez de pronunciar el error.
+        if any(_is_wedged_reply(r) for r in replies):
+            print('[OPENCLAW] sesión clavada detectada — reseteando y reintentando', flush=True)
+            if _attempt == 1 and _reset_session():
+                time.sleep(0.5)
+                return _query_openclaw(text, _attempt=2)
+            return ['Tuve que reiniciar la conversación. ¿Me lo repites?']
+
+        # Quitar cualquier sentinela de error que se haya colado junto a texto válido.
+        replies = [r for r in replies if not _is_wedged_reply(r)]
         if replies:
             return replies
         print('[OPENCLAW] no assistant reply found before timeout', flush=True)
